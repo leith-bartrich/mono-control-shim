@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mono-control-shim"
+version = "0.1.0"
+description = "Thin host-installed shim CLI for mono-control"
+readme = "README.md"
+requires-python = ">=3.11"
+# Intentionally NO third-party dependencies. This is the host-installed shim
+# and must rely on the Python standard library only, for a minimal trusted
+# surface area on the host.
+dependencies = []
+
+[project.scripts]
+mono = "mono_control_shim.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mono_control_shim"]
