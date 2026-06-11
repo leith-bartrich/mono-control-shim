@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-mono = "mono_control_shim.cli:main"
+mproj = "mono_control_shim.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mono_control_shim"]
