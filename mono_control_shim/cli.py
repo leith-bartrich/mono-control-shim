@@ -100,7 +100,7 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="mono",
+        prog="mproj",
         description="Thin host shim that locates the mono workspace and hands off to mono-control.",
     )
     parser.add_argument(

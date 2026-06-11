@@ -24,12 +24,12 @@ uv tool install .
 uv tool install --editable .
 ```
 
-This installs a `mono` command on your `PATH`.
+This installs a `mproj` command on your `PATH`.
 
 ## Usage
 
 ```sh
-mono [--workspace PATH]
+mproj [--workspace PATH]
 ```
 
 The workspace is resolved in this order:
@@ -47,7 +47,7 @@ prints an error and exits non-zero.
 
 ```
 mono-control-shim/
-├── pyproject.toml          # stdlib-only, defines the `mono` entry point
+├── pyproject.toml          # stdlib-only, defines the `mproj` entry point
 ├── README.md
 └── mono_control_shim/
     ├── __init__.py
