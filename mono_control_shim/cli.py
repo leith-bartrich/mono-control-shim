@@ -98,17 +98,70 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
     return True, "docker daemon reachable and .devcontainer config present"
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="mproj",
-        description="Thin host shim that locates the mono workspace and hands off to mono-control.",
-    )
+# Directories that `mproj init` ensures exist in the workspace root. These are
+# the bind-mount sources the mono-control dev container expects to find.
+INIT_DIRS = ("mono-repos", "mono-config")
+
+
+def _run_status(workspace: Path) -> int:
+    """Default command: report the workspace and dev container availability."""
+    print(f"workspace: {workspace}")
+
+    available, detail = _dev_container_available(workspace)
+    status = "available" if available else "unavailable"
+    print(f"mono-control dev container: {status} ({detail})")
+
+    return 0
+
+
+def _run_init(workspace: Path) -> int:
+    """Ensure the workspace has the directories the dev container bind-mounts.
+
+    Creates ``mono-repos/`` and ``mono-config/`` in the workspace root if they
+    are missing. Idempotent: already-present directories are left untouched.
+    """
+    print(f"workspace: {workspace}")
+
+    created = []
+    for name in INIT_DIRS:
+        target = workspace / name
+        if target.is_dir():
+            print(f"exists:  {target}")
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            created.append(target)
+            print(f"created: {target}")
+
+    if not created:
+        print("nothing to do: all workspace directories already exist")
+
+    return 0
+
+
+def _add_workspace_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workspace",
         help="Path to the mono workspace root (a directory containing "
         "mono-control/ and mono-config/). Falls back to the "
         f"{WORKSPACE_ENV_VAR} env var, then to walking up from the current directory.",
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mproj",
+        description="Thin host shim that locates the mono workspace and hands off to mono-control.",
+    )
+    _add_workspace_arg(parser)
+
+    subparsers = parser.add_subparsers(dest="command")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Create the mono-repos/ and mono-config/ directories the dev "
+        "container bind-mounts, if they do not already exist.",
+    )
+    _add_workspace_arg(init_parser)
+
     args = parser.parse_args(argv)
 
     workspace = resolve_workspace(args.workspace)
@@ -123,13 +176,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    print(f"workspace: {workspace}")
+    if args.command == "init":
+        return _run_init(workspace)
 
-    available, detail = _dev_container_available(workspace)
-    status = "available" if available else "unavailable"
-    print(f"mono-control dev container: {status} ({detail})")
-
-    return 0
+    return _run_status(workspace)
 
 
 if __name__ == "__main__":
