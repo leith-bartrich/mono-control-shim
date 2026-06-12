@@ -2,11 +2,21 @@
 
 The thin, host-installed shim for **mono-control**.
 
-This is the small piece of code that lives on your host machine. Its only job
-is to locate the mono workspace and hand off to the real mono-control tooling
-(which runs inside a dev container). The heavy lifting lives in `mono-control`,
-not here — keeping the host footprint tiny and dependency-free is a deliberate
-security goal.
+This is the small piece of code that lives on your host machine. The heavy
+lifting — managing repo state — happens in `mono-control`, which runs inside a
+dev container. The shim's job is to bridge the host and that container while
+keeping the host footprint tiny and dependency-free. That minimalism is a
+deliberate security goal: less code on the host means a smaller attack surface.
+
+## Role
+
+- **Resolves the workspace location** (see [Usage](#usage) for the lookup order).
+- **Bootstraps the workspace** — `mproj init` creates the `mono-config/` and
+  `mono-repos/` directories.
+- **Checks dev container availability** for mono-control.
+- **Future: a gateway for host-level operations** that genuinely cannot run
+  inside the container (e.g. native Windows builds). This is the exception, not
+  the default — containerized execution stays preferred for security.
 
 ## Design constraints
 
@@ -30,6 +40,7 @@ This installs a `mproj` command on your `PATH`.
 
 ```sh
 mproj [--workspace PATH]
+mproj init [--workspace PATH]   # bootstrap mono-config/ and mono-repos/
 ```
 
 The workspace is resolved in this order:
