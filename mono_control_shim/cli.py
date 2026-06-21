@@ -17,15 +17,15 @@ from pathlib import Path
 
 # A directory is recognized as a mono workspace when it contains the manifest
 # directory `mono-config/`. A `mono-control/` checkout may or may not sit beside
-# it; its presence selects dev vs. prod execution (see `control`), not whether
+# it; its presence selects dev vs. artifact execution (see `control`), not whether
 # this is a workspace.
 WORKSPACE_MARKER = "mono-config"
 
 # Env var consulted when --workspace is not passed.
 WORKSPACE_ENV_VAR = "MONO_WORKSPACE"
 
-# Canonical local image ref for prod mode (no mono-control/ checkout present).
-# Distribution via ghcr.io is planned; for now it is built from a checkout.
+# Canonical local image ref for artifact mode (no mono-control/ checkout, or
+# --artifact forced). Distribution via ghcr.io is planned; for now built locally.
 MONO_CONTROL_IMAGE = "mono-control:latest"
 
 
@@ -175,25 +175,60 @@ def _volume_args(workspace: Path) -> list[str]:
     return args
 
 
-def _run_control(workspace: Path, command_args: list[str], *, build: bool = False) -> int:
-    """Hand off to mono-control inside a container.
+# Persistent uv cache volume so repeated `--rm` runs (e.g. test-control) don't
+# re-download dependencies every time.
+_UV_CACHE_VOLUME = "mono-control-uv-cache"
+# Container-side venv path for `uv run`, so it never tries to reuse the host's
+# (possibly Windows) .venv that the live-source mount exposes.
+_TEST_VENV = "/home/codespace/.mono-control-test-venv"
 
-    The presence of a `mono-control/` checkout selects the backend: Docker
-    Compose against live source (dev), or the prebuilt image directly (prod).
+
+def _dispatch(
+    workspace: Path,
+    inner_argv: list[str],
+    *,
+    build: bool = False,
+    dev_only: bool = False,
+    artifact: bool = False,
+    env: dict[str, str] | None = None,
+) -> int:
+    """Run *inner_argv* inside the mono-control container.
+
+    Two backends: **dev mode** runs Docker Compose against a live `mono-control/`
+    checkout; **artifact mode** runs the prebuilt image (mono-control:latest)
+    directly. The backend is chosen by checkout presence, but ``artifact=True``
+    forces artifact mode even when a checkout is present. ``dev_only`` operations
+    (e.g. tests) refuse to run in artifact mode — there is no source to act on.
     """
     docker = shutil.which("docker")
     if docker is None:
         print("error: docker not found on PATH", file=sys.stderr)
         return 1
-    if (workspace / "mono-control").is_dir():
-        return _control_dev(docker, workspace, command_args, build=build)
-    return _control_prod(docker, workspace, command_args, build=build)
+    if (workspace / "mono-control").is_dir() and not artifact:
+        return _dev_run(docker, workspace, inner_argv, build=build, env=env)
+    if dev_only:
+        print(
+            "error: this operation requires a mono-control/ checkout (dev mode).",
+            file=sys.stderr,
+        )
+        return 1
+    if build:
+        print(
+            "warning: --build has no effect in artifact mode (no mono-control source).",
+            file=sys.stderr,
+        )
+    return _artifact_run(docker, workspace, inner_argv, env=env)
 
 
-def _control_dev(
-    docker: str, workspace: Path, command_args: list[str], *, build: bool
+def _dev_run(
+    docker: str,
+    workspace: Path,
+    inner_argv: list[str],
+    *,
+    build: bool = False,
+    env: dict[str, str] | None = None,
 ) -> int:
-    """Dev mode: run the checked-out mono-control via its Docker Compose.
+    """Dev mode: run *inner_argv* via the checked-out mono-control's Compose.
 
     Runs the base ``docker-compose.yml`` (not the VS Code overlay) and bind-mounts
     the live `mono-control/` checkout over the image's baked-in copy, so the
@@ -210,22 +245,25 @@ def _control_dev(
     cmd = [docker, "compose", "-f", str(compose), "run", "--rm"]
     if build:
         cmd.append("--build")
-    # Mount live source over the baked copy so working-tree edits are reflected.
+    for key, value in (env or {}).items():
+        cmd += ["-e", f"{key}={value}"]
+    # Mount live source over the baked copy so working-tree edits are reflected,
+    # plus a persistent uv cache so repeated runs don't re-download deps.
     cmd += ["-v", f"{workspace / 'mono-control'}:/workspaces/mono-control"]
+    cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
     cmd += _volume_args(workspace)
-    cmd += ["mono-control", "mono-control", *command_args]
+    cmd += ["mono-control", *inner_argv]  # compose service name, then the command
     return _exec(cmd)
 
 
-def _control_prod(
-    docker: str, workspace: Path, command_args: list[str], *, build: bool
+def _artifact_run(
+    docker: str,
+    workspace: Path,
+    inner_argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
 ) -> int:
-    """Prod mode: run the prebuilt image directly (no source on disk)."""
-    if build:
-        print(
-            "warning: --build has no effect in prod mode (no mono-control source).",
-            file=sys.stderr,
-        )
+    """Artifact mode: run *inner_argv* in the prebuilt image (no source on disk)."""
     # No source to build from here, so detect a missing image and tell the user
     # how to build one from a checkout, rather than failing obscurely.
     probe = subprocess.run(
@@ -249,11 +287,38 @@ def _control_prod(
         "-e", "MONO_CONTROL_IN_CONTAINER=1",
         "-w", "/workspaces/mono-control",
     ]
+    for key, value in (env or {}).items():
+        cmd += ["-e", f"{key}={value}"]
     if sys.stdin.isatty() and sys.stdout.isatty():
-        cmd.append("-it")  # interactive (e.g. mono-control repl); compose does this in dev
+        cmd.append("-it")  # interactive (e.g. mono-control repl / shell-control)
     cmd += _volume_args(workspace)
-    cmd += [MONO_CONTROL_IMAGE, "mono-control", *command_args]
+    cmd += [MONO_CONTROL_IMAGE, *inner_argv]
     return _exec(cmd)
+
+
+def _run_control(
+    workspace: Path, command_args: list[str], *, build: bool = False, artifact: bool = False
+) -> int:
+    """`mproj control` — run the mono-control artifact (forward to its own CLI)."""
+    return _dispatch(workspace, ["mono-control", *command_args], build=build, artifact=artifact)
+
+
+def _run_shell_control(workspace: Path, *, artifact: bool = False) -> int:
+    """`mproj shell-control` — interactive login shell in the artifact container."""
+    return _dispatch(workspace, ["bash", "-l"], artifact=artifact)
+
+
+def _run_test_control(workspace: Path, command_args: list[str]) -> int:
+    """`mproj test-control` — run mono-control's test suite (dev only)."""
+    return _dispatch(
+        workspace,
+        ["uv", "run", "pytest", *command_args],
+        dev_only=True,
+        # Redirect uv's project venv off the live-source mount (the host .venv it
+        # exposes); UV_LINK_MODE=copy avoids a noisy hardlink warning because the
+        # cache volume and that venv live on different filesystems.
+        env={"UV_PROJECT_ENVIRONMENT": _TEST_VENV, "UV_LINK_MODE": "copy"},
+    )
 
 
 def _exec(cmd: list[str]) -> int:
@@ -269,10 +334,10 @@ def _run_build_control(workspace: Path) -> int:
     """Build the canonical mono-control image (``mono-control:latest``) locally.
 
     Builds from the workspace's `mono-control/` checkout — the same standalone
-    `docker build` the prod-mode error suggests — so prod-mode `control` (and any
-    other consumer) can find the image in the local docker store. Requires the
-    source checkout; a prod-only workspace has nothing to build from. This is also
-    the natural seam for a future `--push` to ghcr.io (see docs/todo).
+    `docker build` the artifact-mode error suggests — so artifact-mode `control`
+    (and any other consumer) can find the image in the local docker store.
+    Requires the source checkout; a checkout-less workspace has nothing to build
+    from. This is also the natural seam for a future `--push` to ghcr.io (see docs/todo).
     """
     source = workspace / "mono-control"
     dockerfile = source / ".devcontainer" / "Dockerfile"
@@ -320,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         "control",
         help="Run mono-control inside its container against the workspace: dev "
         "mode (Docker Compose) when a mono-control/ checkout is present, else "
-        "prod mode (the prebuilt image).",
+        "artifact mode (the prebuilt image).",
     )
     _add_workspace_arg(control_parser)
     control_parser.add_argument(
@@ -328,6 +393,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Dev mode only: rebuild the image before running (picks up "
         "mono-control source changes).",
+    )
+    control_parser.add_argument(
+        "--artifact",
+        action="store_true",
+        help="Run the built artifact image (mono-control:latest) instead of the "
+        "live checkout, even when a mono-control/ checkout is present.",
     )
     control_parser.add_argument(
         "command_args",
@@ -339,9 +410,34 @@ def main(argv: list[str] | None = None) -> int:
     build_parser = subparsers.add_parser(
         "build-control",
         help="Build the mono-control image (mono-control:latest) from the "
-        "workspace's mono-control/ checkout, for prod-mode `control` to run.",
+        "workspace's mono-control/ checkout, for artifact-mode `control` to run.",
     )
     _add_workspace_arg(build_parser)
+
+    shell_parser = subparsers.add_parser(
+        "shell-control",
+        help="Open an interactive shell inside the mono-control container "
+        "(dev mode: live source via Compose; artifact mode: the prebuilt image).",
+    )
+    _add_workspace_arg(shell_parser)
+    shell_parser.add_argument(
+        "--artifact",
+        action="store_true",
+        help="Shell into the built artifact image instead of the live checkout.",
+    )
+
+    test_parser = subparsers.add_parser(
+        "test-control",
+        help="Run mono-control's test suite inside the dev container "
+        "(requires a mono-control/ checkout).",
+    )
+    _add_workspace_arg(test_parser)
+    test_parser.add_argument(
+        "command_args",
+        nargs="*",
+        help="Arguments forwarded to pytest. Precede flags with -- "
+        "(e.g. `mproj test-control -- -k foo -q`).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -362,10 +458,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.command == "control":
-        return _run_control(workspace, args.command_args, build=args.build)
+        return _run_control(
+            workspace, args.command_args, build=args.build, artifact=args.artifact
+        )
 
     if args.command == "build-control":
         return _run_build_control(workspace)
+
+    if args.command == "shell-control":
+        return _run_shell_control(workspace, artifact=args.artifact)
+
+    if args.command == "test-control":
+        return _run_test_control(workspace, args.command_args)
 
     return _run_status(workspace)
 
