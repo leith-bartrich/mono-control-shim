@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,43 @@ WORKSPACE_ENV_VAR = "MONO_WORKSPACE"
 # Canonical local image ref for artifact mode (no mono-control/ checkout, or
 # --artifact forced). Distribution via ghcr.io is planned; for now built locally.
 MONO_CONTROL_IMAGE = "mono-control:latest"
+
+# Host-platform declaration carried into the container (consumed by mono-control's
+# host-platform gate; see mono-control/docs/design/host-platform.md). The shim is
+# the host-side authority that supplies it — it always knows the host — so it sets
+# this on every container run via `-e`, overriding the image's baked `generic`.
+HOST_PLATFORM_ENV = "MONO_CONTROL_HOST_PLATFORM"
+
+# platform.system() -> the token mono-control expects.
+_HOST_PLATFORM_BY_SYSTEM = {
+    "Windows": "windows",
+    "Darwin": "darwin",
+    "Linux": "linux",
+}
+
+
+def _detect_host_platform() -> str:
+    """Return the mono-control host-platform token for this host.
+
+    An explicit ``MONO_CONTROL_HOST_PLATFORM`` in the environment is respected as
+    an override (handy for forcing a target's stamping behavior — e.g. exercising
+    Windows semantics from a Linux box); the container validates whatever it is
+    given. Otherwise the OS is detected. An unmappable host raises ``ValueError``:
+    the shim's whole job here is to supply a concrete platform, so it refuses
+    rather than guessing or silently falling back to ``generic``.
+    """
+    override = os.environ.get(HOST_PLATFORM_ENV)
+    if override:
+        return override
+    system = platform.system()
+    token = _HOST_PLATFORM_BY_SYSTEM.get(system)
+    if token is None:
+        raise ValueError(
+            f"unsupported host platform {system!r}; cannot determine "
+            f"{HOST_PLATFORM_ENV}. Set it explicitly to one of "
+            f"{sorted(_HOST_PLATFORM_BY_SYSTEM.values())}."
+        )
+    return token
 
 
 def _is_workspace(path: Path) -> bool:
@@ -204,6 +242,15 @@ def _dispatch(
     if docker is None:
         print("error: docker not found on PATH", file=sys.stderr)
         return 1
+    # The shim is the host-side authority for the host platform: detect it and
+    # inject it on every container run (last, so it is authoritative over any
+    # caller-supplied env). Refuse on an unmappable host rather than guess.
+    try:
+        host_platform = _detect_host_platform()
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    env = {**(env or {}), HOST_PLATFORM_ENV: host_platform}
     if (workspace / "mono-control").is_dir() and not artifact:
         return _dev_run(docker, workspace, inner_argv, build=build, env=env)
     if dev_only:
