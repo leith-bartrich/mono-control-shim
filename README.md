@@ -17,6 +17,11 @@ deliberate security goal: less code on the host means a smaller attack surface.
   control` to run it, plus `build-control` / `shell-control` / `test-control` for
   its image and container. Naming follows a deliberate convention; see
   [docs/design/command-conventions.md](docs/design/command-conventions.md).
+- **Declares the host platform to the container.** The shim is the host-side
+  authority on which OS it runs on, so on every container run it detects the host
+  and passes it in as `MONO_CONTROL_HOST_PLATFORM` (`windows` / `darwin` /
+  `linux`), which mono-control consumes. Setting that variable in the environment
+  overrides detection (useful for exercising another platform's behavior).
 - **Future: a gateway for host-level operations** that genuinely cannot run
   inside the container (e.g. native Windows builds). This is the exception, not
   the default — containerized execution stays preferred for security.
@@ -54,7 +59,10 @@ Every command also accepts `--workspace PATH`. The naming follows a deliberate
 convention — `mproj <name>` runs an artifact, `mproj <name> <subcommand>`
 forwards to the artifact's CLI, and `mproj <verb>-<name>` operates on its
 container/image. Run and `shell-control` also take `--artifact` to force the
-built image (artifact mode) instead of a live checkout. Full rationale:
+built image (artifact mode) instead of a live checkout. In dev mode, `mproj
+control --build` rebuilds the dev image (via Compose) before running, to pick up
+mono-control source or dependency changes — distinct from `build-control`, which
+builds the standalone `mono-control:latest` artifact image. Full rationale:
 [docs/design/command-conventions.md](docs/design/command-conventions.md).
 
 ### Workspace resolution

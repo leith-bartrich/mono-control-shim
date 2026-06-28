@@ -384,7 +384,7 @@ def _run_build_control(workspace: Path) -> int:
     `docker build` the artifact-mode error suggests — so artifact-mode `control`
     (and any other consumer) can find the image in the local docker store.
     Requires the source checkout; a checkout-less workspace has nothing to build
-    from. This is also the natural seam for a future `--push` to ghcr.io (see docs/todo).
+    from. This is also the natural seam for a future `--push` to ghcr.io.
     """
     source = workspace / "mono-control"
     dockerfile = source / ".devcontainer" / "Dockerfile"

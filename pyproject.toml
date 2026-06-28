@@ -8,6 +8,17 @@ version = "0.1.0"
 description = "Thin host-installed shim CLI for mono-control"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Bradley Friedman", email = "brad@fie.us" }]
+keywords = ["mono-control", "shim", "cli", "docker", "devcontainer"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+]
 # Intentionally NO third-party dependencies. This is the host-installed shim
 # and must rely on the Python standard library only, for a minimal trusted
 # surface area on the host.
