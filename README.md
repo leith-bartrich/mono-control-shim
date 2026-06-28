@@ -1,5 +1,20 @@
 # mono-control-shim
 
+## The mono repository control system
+
+This project is part of a system for managing development with a **mono
+repository** approach — many repos and their configuration treated as one
+coordinated workspace. `mono-control-shim` is the top-level command shim and
+entrypoint to that system: the `mproj` command you run on your host. Over time
+it will grow to better orchestrate the system and its sub-components, but it
+stays deliberately thin. Because the shim is the one piece that executes on the
+host, it is heavily dependent on reducing supply-chain dependencies — every
+dependency it takes on is one the host inherits. The heavy lifting lives
+in containerized artifacts (today, `mono-control`); the shim's job is to locate
+the workspace and hand off to them.
+
+## The shim
+
 The thin, host-installed shim for **mono-control**.
 
 This is the small piece of code that lives on your host machine. The heavy
