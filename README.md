@@ -26,8 +26,9 @@ deliberate security goal: less code on the host means a smaller attack surface.
 ## Role
 
 - **Resolves the workspace location** (see [Commands](#commands) for the lookup order).
-- **Bootstraps the workspace** — `mproj init` creates the `mono-config/` and
-  `mono-repos/` directories.
+- **Bootstraps the workspace** — `mproj init` creates the `mono-config/`,
+  `mono-repos/` and `mono-repos-offline/` directories (all host-side bind-mount
+  sources the container needs).
 - **Runs and operates on the mono-control artifact** in its container — `mproj
   control` to run it, plus `build-control` / `shell-control` / `test-control` for
   its image and container. Naming follows a deliberate convention; see
@@ -63,7 +64,7 @@ This installs a `mproj` command on your `PATH`.
 
 ```sh
 mproj                      # report the workspace and container availability
-mproj init                 # bootstrap mono-config/ and mono-repos/
+mproj init                 # bootstrap mono-config/, mono-repos/ and mono-repos-offline/
 mproj control [args]       # run mono-control (args forward to its CLI; use -- for flags)
 mproj build-control        # build the mono-control image (mono-control:latest)
 mproj shell-control        # interactive shell in the mono-control container

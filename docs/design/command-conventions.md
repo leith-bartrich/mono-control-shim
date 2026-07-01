@@ -112,7 +112,7 @@ not take the `<verb>-<name>` form:
 
 ```
 mproj            # default: report the workspace and container availability
-mproj init       # bootstrap the workspace's mono-config/ and mono-repos/ dirs
+mproj init       # bootstrap mono-config/, mono-repos/ and mono-repos-offline/ dirs
 ```
 
 These are shim-native — they are about the workspace itself. Keep them as plain

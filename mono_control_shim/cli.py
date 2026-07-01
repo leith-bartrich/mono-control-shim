@@ -159,8 +159,11 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
 
 
 # Directories that `mproj init` ensures exist in the workspace root. These are
-# the bind-mount sources the mono-control dev container expects to find.
-INIT_DIRS = ("mono-repos", "mono-config")
+# the bind-mount sources the mono-control container expects to find. They MUST be
+# host-side dirs (not container-local): mono-repos-offline in particular is the
+# non-destructive retire holding area, so leaving it unmounted would lose unpushed
+# work — and under `docker compose run --rm` it would vanish after every call.
+INIT_DIRS = ("mono-repos", "mono-repos-offline", "mono-config")
 
 
 def _run_status(workspace: Path) -> int:
@@ -177,8 +180,9 @@ def _run_status(workspace: Path) -> int:
 def _run_init(workspace: Path) -> int:
     """Ensure the workspace has the directories the dev container bind-mounts.
 
-    Creates ``mono-repos/`` and ``mono-config/`` in the workspace root if they
-    are missing. Idempotent: already-present directories are left untouched.
+    Creates ``mono-repos/``, ``mono-repos-offline/`` and ``mono-config/`` in the
+    workspace root if they are missing. Idempotent: already-present directories are
+    left untouched.
     """
     print(f"workspace: {workspace}")
 
@@ -205,7 +209,7 @@ def _volume_args(workspace: Path) -> list[str]:
     mono-control); only the host sources vary per invocation.
     """
     args: list[str] = []
-    for name in INIT_DIRS:  # mono-repos, mono-config
+    for name in INIT_DIRS:  # mono-repos, mono-repos-offline, mono-config
         source = workspace / name
         if not source.is_dir():
             print(f"warning: {source} does not exist; run `mproj init`.", file=sys.stderr)
@@ -423,8 +427,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
     init_parser = subparsers.add_parser(
         "init",
-        help="Create the mono-repos/ and mono-config/ directories the dev "
-        "container bind-mounts, if they do not already exist.",
+        help="Create the mono-repos/, mono-repos-offline/ and mono-config/ "
+        "directories the container bind-mounts, if they do not already exist.",
     )
     _add_workspace_arg(init_parser)
 
