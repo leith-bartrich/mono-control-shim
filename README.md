@@ -38,6 +38,10 @@ deliberate security goal: less code on the host means a smaller attack surface.
   and passes it in as `MONO_CONTROL_HOST_PLATFORM` (`windows` / `darwin` /
   `linux`), which mono-control consumes. Setting that variable in the environment
   overrides detection (useful for exercising another platform's behavior).
+- **Supplies the GitHub credential to the container.** Cloning private repos needs
+  a token, and the container cannot get one — your host's lives in an OS keyring no
+  Linux container can reach. The shim resolves one host-side and hands it in as
+  `MONO_CONTROL_GITHUB_TOKEN` (see [GitHub token](#github-token)).
 - **Future: a gateway for host-level operations** that genuinely cannot run
   inside the container (e.g. native Windows builds). This is the exception, not
   the default — containerized execution stays preferred for security.
@@ -94,6 +98,45 @@ A workspace is defined by its `mono-config/` manifest dir; a sibling
 `mono-control/` checkout is optional and selects dev vs. artifact execution. If
 no workspace is found, the shim prints an error and exits non-zero.
 
+### GitHub token
+
+Managed repos are usually private, so mono-control needs a credential to clone them.
+The shim resolves one on every container run, in this order:
+
+1. `MONO_CONTROL_GITHUB_TOKEN`, if set.
+2. `GH_TOKEN`, then `GITHUB_TOKEN` (the ecosystem's conventions).
+3. `gh auth token` — your existing `gh` login. **A warning is printed when this is
+   used.**
+4. Nothing. This is *not* an error: public remotes need no credential, and most of
+   mono-control needs no network. A private remote with no token then fails inside
+   the container with a message naming both ways out.
+
+**Prefer a scoped token.** mono-control never writes to a remote — it only clones,
+lists refs, and checks out — so a **fine-grained PAT with read-only Contents, limited
+to the repos you manage**, is all it needs. Your `gh` OAuth token, by contrast, carries
+`repo` + `workflow` + `gist` *write* access to every repo you own, and `workflow` reaches
+your GitHub Actions secrets. Export the scoped one and the fallback never fires:
+
+```sh
+export MONO_CONTROL_GITHUB_TOKEN=github_pat_...
+```
+
+The token is passed to `docker` by **name only** (a valueless `-e`), with the value
+carried in the environment — so it never appears in this process's `argv`, where any
+local process could read it off the process table. It is never printed. Inside the
+container a credential helper supplies it to git from the environment, scoped to
+`github.com` alone, and it is never written to disk. Full rationale: mono-control's
+[docs/design/github-auth.md](https://github.com/leith-bartrich/mono-control/blob/master/docs/design/github-auth.md).
+
+## Tests
+
+Stdlib `unittest` — a test framework is a dependency like any other, and this repo
+takes none:
+
+```sh
+python -m unittest discover -s tests -t .
+```
+
 ## Layout
 
 ```
@@ -103,6 +146,8 @@ mono-control-shim/
 ├── docs/
 │   └── design/
 │       └── command-conventions.md   # the mproj command-naming pattern
+├── tests/
+│   └── test_cli.py         # stdlib unittest; token resolution + secret plumbing
 └── mono_control_shim/
     ├── __init__.py
     └── cli.py              # argparse CLI: workspace resolution + artifact ops

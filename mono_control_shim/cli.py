@@ -42,6 +42,72 @@ _HOST_PLATFORM_BY_SYSTEM = {
     "Linux": "linux",
 }
 
+# GitHub credential carried into the container (see mono-control's
+# docs/design/github-auth.md). Like the host platform, this is host-side knowledge the
+# container cannot obtain for itself — a credential lives in an OS keyring no Linux
+# container can reach — so the shim is again the component that must supply it.
+#
+# Unlike the host platform it is a SECRET, which changes how it is passed, not whether:
+# it is put in the environment handed to `docker` and named by a VALUELESS `-e`, so it
+# never appears in this process's argv (where any local process could read it off the
+# process table). It is never printed, and never given a value on a command line.
+GITHUB_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
+
+# Environment variables consulted for a token, in order, before falling back to `gh`.
+# The first is our own; the rest are the ecosystem's de-facto standards, honored so a
+# CI runner or an existing shell setup works without special-casing mono-control.
+_TOKEN_ENV_VARS = (GITHUB_TOKEN_ENV, "GH_TOKEN", "GITHUB_TOKEN")
+
+_GH_FALLBACK_WARNING = (
+    f"warning: no {GITHUB_TOKEN_ENV} set; falling back to your `gh` OAuth token.\n"
+    "  That token typically carries repo + workflow + gist WRITE access to every repo\n"
+    "  you own, but mono-control only ever reads (clone / ls-remote / checkout).\n"
+    f"  Prefer a fine-grained PAT with read-only Contents, exported as {GITHUB_TOKEN_ENV}."
+)
+
+
+def _resolve_github_token() -> str | None:
+    """Return a GitHub token for the container, or ``None`` if none is available.
+
+    Precedence mirrors ``_detect_host_platform``: an explicit environment value wins,
+    otherwise we go and find one. Here "find one" means asking `gh` for the token it
+    already holds in the host keyring.
+
+    Returning ``None`` is a normal outcome, NOT an error — public remotes need no
+    credential and most of mono-control needs no network at all. A private remote with
+    no token fails inside the container, where the failure is specific and can say so;
+    guessing here that the user will need one would break every offline invocation.
+
+    The token is never logged. The `gh` fallback prints a warning naming the write
+    scopes it drags along, so the convenient path is never also the silent one.
+    """
+    for name in _TOKEN_ENV_VARS:
+        token = os.environ.get(name)
+        if token:
+            return token
+
+    gh = shutil.which("gh")
+    if gh is None:
+        return None
+    try:
+        result = subprocess.run(
+            [gh, "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None  # gh present but not logged in.
+
+    token = result.stdout.strip()
+    if not token:
+        return None
+    print(_GH_FALLBACK_WARNING, file=sys.stderr)
+    return token
+
 
 def _detect_host_platform() -> str:
     """Return the mono-control host-platform token for this host.
@@ -255,8 +321,21 @@ def _dispatch(
         print(f"error: {e}", file=sys.stderr)
         return 1
     env = {**(env or {}), HOST_PLATFORM_ENV: host_platform}
+
+    # The shim is likewise the host-side authority for the GitHub credential, for the
+    # same reason: the container cannot reach the host keyring. But a token is a
+    # SECRET, so it does NOT join `env` above — that dict becomes `-e KEY=VALUE` on the
+    # command line, and argv is world-readable. Secrets are passed by name only; see
+    # `_secret_args` / `_secret_environ`. No token is a normal state, not an error.
+    secrets: dict[str, str] = {}
+    token = _resolve_github_token()
+    if token:
+        secrets[GITHUB_TOKEN_ENV] = token
+
     if (workspace / "mono-control").is_dir() and not artifact:
-        return _dev_run(docker, workspace, inner_argv, build=build, env=env)
+        return _dev_run(
+            docker, workspace, inner_argv, build=build, env=env, secrets=secrets
+        )
     if dev_only:
         print(
             "error: this operation requires a mono-control/ checkout (dev mode).",
@@ -268,7 +347,31 @@ def _dispatch(
             "warning: --build has no effect in artifact mode (no mono-control source).",
             file=sys.stderr,
         )
-    return _artifact_run(docker, workspace, inner_argv, env=env)
+    return _artifact_run(docker, workspace, inner_argv, env=env, secrets=secrets)
+
+
+def _secret_args(secrets: dict[str, str] | None) -> list[str]:
+    """Render *secrets* as valueless ``-e NAME`` flags.
+
+    Both `docker run` and `docker compose run` read a valueless ``-e NAME`` from the
+    environment of the process invoking them — which is exactly what we want: the name
+    goes in argv, the value does not.
+    """
+    args: list[str] = []
+    for key in secrets or {}:
+        args += ["-e", key]
+    return args
+
+
+def _secret_environ(secrets: dict[str, str] | None) -> dict[str, str] | None:
+    """Our environment plus *secrets*, to hand to docker; ``None`` when there are none.
+
+    ``None`` means "inherit ours unchanged", which is ``subprocess``'s default and
+    keeps the no-token path byte-for-byte what it was before secrets existed.
+    """
+    if not secrets:
+        return None
+    return {**os.environ, **secrets}
 
 
 def _dev_run(
@@ -278,6 +381,7 @@ def _dev_run(
     *,
     build: bool = False,
     env: dict[str, str] | None = None,
+    secrets: dict[str, str] | None = None,
 ) -> int:
     """Dev mode: run *inner_argv* via the checked-out mono-control's Compose.
 
@@ -298,13 +402,14 @@ def _dev_run(
         cmd.append("--build")
     for key, value in (env or {}).items():
         cmd += ["-e", f"{key}={value}"]
+    cmd += _secret_args(secrets)
     # Mount live source over the baked copy so working-tree edits are reflected,
     # plus a persistent uv cache so repeated runs don't re-download deps.
     cmd += ["-v", f"{workspace / 'mono-control'}:/workspaces/mono-control"]
     cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
     cmd += _volume_args(workspace)
     cmd += ["mono-control", *inner_argv]  # compose service name, then the command
-    return _exec(cmd)
+    return _exec(cmd, env=_secret_environ(secrets))
 
 
 def _artifact_run(
@@ -313,6 +418,7 @@ def _artifact_run(
     inner_argv: list[str],
     *,
     env: dict[str, str] | None = None,
+    secrets: dict[str, str] | None = None,
 ) -> int:
     """Artifact mode: run *inner_argv* in the prebuilt image (no source on disk)."""
     # No source to build from here, so detect a missing image and tell the user
@@ -340,11 +446,12 @@ def _artifact_run(
     ]
     for key, value in (env or {}).items():
         cmd += ["-e", f"{key}={value}"]
+    cmd += _secret_args(secrets)
     if sys.stdin.isatty() and sys.stdout.isatty():
         cmd.append("-it")  # interactive (e.g. mono-control repl / shell-control)
     cmd += _volume_args(workspace)
     cmd += [MONO_CONTROL_IMAGE, *inner_argv]
-    return _exec(cmd)
+    return _exec(cmd, env=_secret_environ(secrets))
 
 
 def _run_control(
@@ -367,15 +474,25 @@ def _run_test_control(workspace: Path, command_args: list[str]) -> int:
         dev_only=True,
         # Redirect uv's project venv off the live-source mount (the host .venv it
         # exposes); UV_LINK_MODE=copy avoids a noisy hardlink warning because the
-        # cache volume and that venv live on different filesystems.
-        env={"UV_PROJECT_ENVIRONMENT": _TEST_VENV, "UV_LINK_MODE": "copy"},
+        # cache volume and that venv live on different filesystems. UV_LOCKED makes
+        # `uv run` install exactly what uv.lock pins — the image build is already
+        # locked, and this was the last uv path that still resolved freely.
+        env={
+            "UV_PROJECT_ENVIRONMENT": _TEST_VENV,
+            "UV_LINK_MODE": "copy",
+            "UV_LOCKED": "1",
+        },
     )
 
 
-def _exec(cmd: list[str]) -> int:
-    """Run *cmd*, inheriting stdio, and return its exit code as ours."""
+def _exec(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
+    """Run *cmd*, inheriting stdio, and return its exit code as ours.
+
+    ``env`` replaces the child's environment wholesale; ``None`` inherits ours. It is
+    how secrets reach docker without passing through argv (see ``_secret_environ``).
+    """
     try:
-        return subprocess.run(cmd, check=False).returncode
+        return subprocess.run(cmd, check=False, env=env).returncode
     except (OSError, subprocess.SubprocessError) as e:
         print(f"error: failed to launch container: {e}", file=sys.stderr)
         return 1
