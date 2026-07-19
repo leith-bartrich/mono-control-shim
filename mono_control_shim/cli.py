@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mono_control_shim.broker import BrokerServer
+from mono_control_shim.broker import BrokerServer, HostContext
 
 # A directory is recognized as a mono workspace when it contains the manifest
 # directory `mono-config/`. A `mono-control/` checkout may or may not sit beside
@@ -316,6 +316,7 @@ def _dispatch(
     dev_only: bool = False,
     artifact: bool = False,
     env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Run *inner_argv* inside the mono-control container.
 
@@ -351,11 +352,26 @@ def _dispatch(
 
     # Stand up the host-callback broker for the lifetime of the container run, so the
     # container can ask the host to do the few things only the host can (see broker.py).
-    # It is BEST-EFFORT in Step 1: nothing depends on it yet, so a failure to bind must
-    # not turn a working command into a broken one. Warn and run without it.
+    # It is BEST-EFFORT: a failure to bind must not turn a working command into a
+    # broken one. Warn and run without it.
+    #
+    # Importing the verb packs is what registers their handlers (@verb runs at import);
+    # the host context carries the host paths + token those handlers act on — knowledge
+    # the container cannot have and must not be handed. The paths mirror the bind-mount
+    # sources in `_volume_args` (INIT_DIRS): mono-repos is the materialized root,
+    # mono-repos-offline the offline holding area, mono-config the manifest dir.
+    from mono_control_shim import verbs  # noqa: F401  (import = register packs)
+
+    host_context = HostContext(
+        workspace_root=workspace / "mono-repos",
+        offline_root=workspace / "mono-repos-offline",
+        config_dir=workspace / "mono-config",
+        github_token=token,
+    )
+
     broker: BrokerServer | None = None
     try:
-        broker = BrokerServer()
+        broker = BrokerServer(host_context)
         broker.start()
     except OSError as e:
         print(
@@ -377,7 +393,8 @@ def _dispatch(
     try:
         if (workspace / "mono-control").is_dir() and not artifact:
             return _dev_run(
-                docker, workspace, inner_argv, build=build, env=env, secrets=secrets
+                docker, workspace, inner_argv, build=build, env=env, secrets=secrets,
+                stdout_path=stdout_path,
             )
         if dev_only:
             print(
@@ -390,7 +407,10 @@ def _dispatch(
                 "warning: --build has no effect in artifact mode (no mono-control source).",
                 file=sys.stderr,
             )
-        return _artifact_run(docker, workspace, inner_argv, env=env, secrets=secrets)
+        return _artifact_run(
+            docker, workspace, inner_argv, env=env, secrets=secrets,
+            stdout_path=stdout_path,
+        )
     finally:
         # The broker's authority is scoped to exactly one container run. Ending it here
         # means the token dies with the command that issued it.
@@ -430,6 +450,7 @@ def _dev_run(
     build: bool = False,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Dev mode: run *inner_argv* via the checked-out mono-control's Compose.
 
@@ -457,7 +478,10 @@ def _dev_run(
     cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
     cmd += _volume_args(workspace)
     cmd += ["mono-control", *inner_argv]  # compose service name, then the command
-    return _exec(cmd, env=_secret_environ(secrets))
+    # Only thread stdout_path when capturing (json-schema-control), so the ordinary
+    # streaming call shape is byte-for-byte unchanged.
+    extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
+    return _exec(cmd, env=_secret_environ(secrets), **extra)
 
 
 def _artifact_run(
@@ -467,6 +491,7 @@ def _artifact_run(
     *,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Artifact mode: run *inner_argv* in the prebuilt image (no source on disk)."""
     # No source to build from here, so detect a missing image and tell the user
@@ -500,11 +525,14 @@ def _artifact_run(
     for key, value in (env or {}).items():
         cmd += ["-e", f"{key}={value}"]
     cmd += _secret_args(secrets)
-    if sys.stdin.isatty() and sys.stdout.isatty():
+    if stdout_path is None and sys.stdin.isatty() and sys.stdout.isatty():
+        # No pseudo-TTY when capturing stdout to a file: `-t` would inject terminal
+        # control bytes and corrupt the JSON we are trying to save.
         cmd.append("-it")  # interactive (e.g. mono-control repl / shell-control)
     cmd += _volume_args(workspace)
     cmd += [MONO_CONTROL_IMAGE, *inner_argv]
-    return _exec(cmd, env=_secret_environ(secrets))
+    extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
+    return _exec(cmd, env=_secret_environ(secrets), **extra)
 
 
 def _run_control(
@@ -538,13 +566,49 @@ def _run_test_control(workspace: Path, command_args: list[str]) -> int:
     )
 
 
-def _exec(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
+# Where `json-schema-control` writes the emitted wire contract. Inside this
+# package's tree so the generated file is checked in and diffable — the host side
+# implements to this schema, so a drift shows up in review.
+SCHEMA_PATH = Path(__file__).resolve().parent / "schema" / "wire-schema.json"
+
+
+def _run_json_schema_control(workspace: Path) -> int:
+    """`mproj json-schema-control` — refresh this repo's checked-in wire schema.
+
+    Runs the container's ``mono-control emit-schema`` and captures its stdout (the
+    JSON Schema of the broker's 20 wire models) into ``SCHEMA_PATH``. Sibling of
+    ``test-control``; like it, it needs the container (dev mode via Compose, or the
+    prebuilt artifact image). The broker's own diagnostics stay on stderr, so only
+    the schema JSON lands in the file.
+    """
+    rc = _dispatch(
+        workspace, ["mono-control", "emit-schema"], stdout_path=SCHEMA_PATH
+    )
+    if rc == 0:
+        print(f"wrote: {SCHEMA_PATH}", file=sys.stderr)
+    return rc
+
+
+def _exec(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
+) -> int:
     """Run *cmd*, inheriting stdio, and return its exit code as ours.
 
     ``env`` replaces the child's environment wholesale; ``None`` inherits ours. It is
     how secrets reach docker without passing through argv (see ``_secret_environ``).
+
+    ``stdout_path`` redirects the child's stdout to that file (stderr still streams
+    to ours) — how ``json-schema-control`` captures ``emit-schema``'s JSON into the
+    repo while the broker's diagnostics stay on the terminal.
     """
     try:
+        if stdout_path is not None:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(stdout_path, "w", encoding="utf-8", newline="\n") as out:
+                return subprocess.run(cmd, check=False, env=env, stdout=out).returncode
         return subprocess.run(cmd, check=False, env=env).returncode
     except (OSError, subprocess.SubprocessError) as e:
         print(f"error: failed to launch container: {e}", file=sys.stderr)
@@ -660,6 +724,13 @@ def main(argv: list[str] | None = None) -> int:
         "(e.g. `mproj test-control -- -k foo -q`).",
     )
 
+    schema_parser = subparsers.add_parser(
+        "json-schema-control",
+        help="Emit mono-control's broker wire-contract JSON Schema into this "
+        f"repo ({SCHEMA_PATH.name}), for a checked-in, diffable contract.",
+    )
+    _add_workspace_arg(schema_parser)
+
     args = parser.parse_args(argv)
 
     # `init` bootstraps the workspace, so it resolves its target without
@@ -691,6 +762,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "test-control":
         return _run_test_control(workspace, args.command_args)
+
+    if args.command == "json-schema-control":
+        return _run_json_schema_control(workspace)
 
     return _run_status(workspace)
 
