@@ -67,6 +67,15 @@ PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+
+# Cap on a request body, before it is read. The container is authenticated and on
+# loopback, so this is not today's threat — it is that `Content-Length` is a number
+# the *client* chooses and we currently allocate to it. Step 2's verbs take real
+# payloads (paths, refs, manifests), all of which fit in kilobytes; a megabyte is
+# already generous and turns a claimed 4 GiB body into a cheap 413 instead of a
+# 4 GiB allocation on the host.
+MAX_BODY_BYTES = 1 << 20
 
 _LOG = logging.getLogger("mono_control_shim.broker")
 
@@ -170,6 +179,10 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            # Setting the flag makes us hang up; saying so makes it a clean HTTP/1.1
+            # close rather than one the client discovers by reading EOF mid-reuse.
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -188,6 +201,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authenticated():
             # No method to name yet: refusing before parse is the point.
             _LOG.warning("auth=fail outcome=401")
+            # We are answering without draining the request body, so this connection
+            # can no longer be reused: under keep-alive the undrained bytes would be
+            # read as the *next* request line. Close instead of desynchronizing — a
+            # rejected caller does not get to smuggle a second request past the gate.
+            self.close_connection = True
             self._respond(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
 
@@ -195,6 +213,14 @@ class _Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
+        if length > MAX_BODY_BYTES:
+            # Refuse on the declared length, before allocating to it.
+            _LOG.warning("auth=ok outcome=413 declared=%d", length)
+            self.close_connection = True  # undrained body; see the 401 path above
+            self._respond(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"}
+            )
+            return
         raw = self.rfile.read(length) if length > 0 else b""
 
         try:
@@ -239,7 +265,7 @@ class _Handler(BaseHTTPRequestHandler):
             # spill host internals across the seam: the traceback goes to the host's
             # log, the container gets a flat "internal error".
             _LOG.exception("method=%s auth=ok outcome=error", method)
-            self._error(INVALID_PARAMS, "internal error", request_id=request_id)
+            self._error(INTERNAL_ERROR, "internal error", request_id=request_id)
             return
 
         _LOG.info("method=%s auth=ok outcome=ok", method)

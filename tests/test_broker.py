@@ -192,6 +192,105 @@ class Protocol(BrokerTestCase):
         self.assertEqual(payload["id"], "abc-123")
 
 
+class InternalError(BrokerTestCase):
+    """A verb that raises must not take the daemon down, nor leak host internals."""
+
+    def setUp(self) -> None:
+        super().setUp()
+
+        @broker.verb("test.boom")
+        def _boom(params):  # noqa: ANN001, ANN202
+            raise RuntimeError("secret host detail: C:/Users/someone/.ssh/id_ed25519")
+
+        self.addCleanup(broker._VERBS.pop, "test.boom", None)
+
+    def test_raising_verb_is_internal_error(self) -> None:
+        status, payload = self._call("test.boom")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["error"]["code"], broker.INTERNAL_ERROR)
+
+    def test_the_exception_text_does_not_cross_the_seam(self) -> None:
+        _, payload = self._call("test.boom")
+
+        # The traceback belongs in the host's log; the container gets a flat message.
+        self.assertEqual(payload["error"]["message"], "internal error")
+        self.assertNotIn("id_ed25519", json.dumps(payload))
+
+    def test_the_server_survives_and_still_serves(self) -> None:
+        self._call("test.boom")
+        status, payload = self._call("ping")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"], "pong")
+
+
+class BodyLimit(BrokerTestCase):
+    """`Content-Length` is a number the caller chooses; we must not simply trust it."""
+
+    def _raw_post(self, headers: str, body: bytes = b"") -> bytes:
+        """Speak HTTP by hand, so we can declare a length we do not send."""
+        import socket
+
+        with socket.create_connection(("127.0.0.1", self.broker.port), timeout=5) as sock:
+            sock.sendall(headers.encode("ascii") + body)
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+    def test_an_absurd_declared_length_is_refused_not_allocated(self) -> None:
+        # 4 GiB claimed, zero bytes sent. The point is that this returns promptly
+        # rather than the host reserving 4 GiB for a body that will never arrive.
+        response = self._raw_post(
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            f"Authorization: Bearer {self.broker.token}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {4 * (1 << 30)}\r\n"
+            "\r\n"
+        )
+
+        self.assertIn(b"413", response.split(b"\r\n")[0])
+
+    def test_an_oversized_body_is_refused_before_auth_is_bypassed(self) -> None:
+        # An unauthenticated caller must still hit the 401, not the size check:
+        # auth is the outer gate and nothing gets to reorder that.
+        response = self._raw_post(
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer wrong\r\n"
+            f"Content-Length: {4 * (1 << 30)}\r\n"
+            "\r\n"
+        )
+
+        self.assertIn(b"401", response.split(b"\r\n")[0])
+
+    def test_a_normal_body_is_unaffected(self) -> None:
+        _, payload = self._call("ping")
+
+        self.assertEqual(payload["result"], "pong")
+
+    def test_a_rejected_request_closes_the_connection(self) -> None:
+        # We answer 401/413 without draining the body, so the connection cannot be
+        # reused: leftover bytes would otherwise be parsed as the next request line.
+        response = self._raw_post(
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer wrong\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n",
+            b"12345",
+        )
+
+        # recv() returned b"" (loop exited) => the server hung up, as it must.
+        self.assertIn(b"401", response.split(b"\r\n")[0])
+        self.assertIn(b"Connection: close", response)
+
+
 class Lifecycle(unittest.TestCase):
     """Start/stop, and the port contract."""
 
