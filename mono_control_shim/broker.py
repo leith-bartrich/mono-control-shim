@@ -53,9 +53,11 @@ import json
 import logging
 import secrets
 import threading
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 # Bumped when the wire contract changes; reported by `broker.info` so a client can
 # tell what it is talking to before it depends on a verb existing.
@@ -68,6 +70,14 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+# Implementation-defined "server error" (the JSON-RPC -32000..-32099 range). Unlike
+# INTERNAL_ERROR — which flattens away any detail because it wraps an *unexpected*
+# crash — this is a *known, reported* business failure a verb chooses to surface with
+# its own message (e.g. "repo not found" on a purge). The wire shape here matches the
+# executable spec (`broker_shim.py`), so the container sees the same code it does in
+# its own test suite.
+SERVER_ERROR = -32000
 
 # Cap on a request body, before it is read. The container is authenticated and on
 # loopback, so this is not today's threat — it is that `Content-Length` is a number
@@ -103,15 +113,59 @@ def _configure_logging() -> None:
     _LOG.addHandler(handler)
     _LOG.setLevel(_AUDIT_LEVEL)
 
+@dataclass(frozen=True)
+class HostContext:
+    """The host-side capabilities a verb may act on, resolved once per run.
+
+    Step 1's verbs (``ping`` / ``broker.info``) are pure and need nothing here.
+    Step 2's verbs act on the host filesystem and network, so they need to know
+    *which* host paths and *which* credential — knowledge the container cannot
+    have and must not be handed. ``cli._dispatch`` already resolves the workspace
+    root and the GitHub token; it builds one of these and hands it to
+    :class:`BrokerServer`, which threads it to every handler.
+
+    The token lives here and nowhere on the wire: it is a host secret the verbs
+    consume, never a value the broker echoes back. It is never logged (the audit
+    line records method + outcome only), and reaches ``git`` through a credential
+    helper via the environment, never on argv.
+    """
+
+    workspace_root: Path
+    offline_root: Path
+    config_dir: Path
+    github_token: Optional[str] = None
+
+
+class VerbError(Exception):
+    """A verb's *deliberate*, reportable failure — mapped to a JSON-RPC error.
+
+    Distinct from an unexpected crash (which the dispatcher flattens to a bare
+    ``INTERNAL_ERROR`` so no host internals leak): a ``VerbError`` carries a code
+    the verb chose (``INVALID_PARAMS`` for rejected input, ``SERVER_ERROR`` for a
+    known business failure) and a message meant to cross the seam. Verbs raise it
+    at the validation boundary and for the handful of expected not-found paths;
+    the dispatcher turns it into the matching error envelope.
+    """
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 # name -> handler. A dict, not a plugin system: the whole value of this registry is
 # that reading it tells you the complete set of things the host will do.
-_VERBS: dict[str, Callable[[dict[str, Any]], Any]] = {}
+#
+# Handlers take ``(params, ctx)``: the by-name params from the wire, plus the
+# host context (``None`` for the context-free Step 1 verbs, which ignore it).
+Handler = Callable[[dict[str, Any], Optional[HostContext]], Any]
+_VERBS: dict[str, Handler] = {}
 
 
-def verb(name: str) -> Callable[[Callable[[dict[str, Any]], Any]], Callable[[dict[str, Any]], Any]]:
+def verb(name: str) -> Callable[[Handler], Handler]:
     """Register a handler under *name*. Unregistered methods are refused."""
 
-    def register(func: Callable[[dict[str, Any]], Any]) -> Callable[[dict[str, Any]], Any]:
+    def register(func: Handler) -> Handler:
         _VERBS[name] = func
         return func
 
@@ -119,18 +173,18 @@ def verb(name: str) -> Callable[[Callable[[dict[str, Any]], Any]], Callable[[dic
 
 
 @verb("ping")
-def _ping(params: dict[str, Any]) -> str:
+def _ping(params: dict[str, Any], ctx: Optional[HostContext]) -> str:
     """Liveness. Deliberately trivial and side-effect-free.
 
     This is the verb the container-reachability spike asserts on, so it must prove
     the whole path — routing, auth, dispatch, envelope — while proving nothing about
-    the host's state.
+    the host's state. It ignores ``ctx``: liveness must not depend on a workspace.
     """
     return "pong"
 
 
 @verb("broker.info")
-def _info(params: dict[str, Any]) -> dict[str, Any]:
+def _info(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
     """Self-description: wire version plus the exact set of callable verbs.
 
     Advertising the verb list is not a leak — the refusal is enforced server-side
@@ -156,6 +210,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Set by BrokerServer when the socket is created.
     token: str = ""
+    # The host capabilities Step 2's verbs act on. ``None`` when the broker was
+    # started without a context (Step 1's verbs, and the broker's own tests) —
+    # a git/config verb then fails cleanly rather than acting on a guessed root.
+    context: Optional[HostContext] = None
 
     def log_message(self, format: str, *args: Any) -> None:
         """Route the stdlib's per-request line into logging instead of raw stderr."""
@@ -259,7 +317,15 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = handler(params)
+            result = handler(params, self.context)
+        except VerbError as e:
+            # A verb's *deliberate* failure: rejected input or an expected
+            # not-found. The code and message are the verb's own and are meant to
+            # be seen, so — unlike the internal-error path below — the message
+            # crosses the seam. Verbs keep these messages free of host paths.
+            _LOG.warning("method=%s auth=ok outcome=verb-error code=%d", method, e.code)
+            self._error(e.code, e.message, request_id=request_id)
+            return
         except Exception:
             # A verb blowing up must not take the daemon down with it, and must not
             # spill host internals across the seam: the traceback goes to the host's
@@ -285,9 +351,15 @@ class BrokerServer:
     speak to each other's broker.
     """
 
-    def __init__(self, bind_addr: str = "127.0.0.1") -> None:
+    def __init__(
+        self, context: Optional[HostContext] = None, bind_addr: str = "127.0.0.1"
+    ) -> None:
         self.bind_addr = bind_addr
         self.token = secrets.token_urlsafe(32)
+        # The host capabilities handed to every verb. ``None`` keeps the Step 1
+        # broker (and its tests) working unchanged; ``cli._dispatch`` supplies a
+        # real one for a container run.
+        self.context = context
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -306,7 +378,11 @@ class BrokerServer:
         take that choice away from the one place that knows whether it matters.
         """
         _configure_logging()
-        handler = type("_BoundHandler", (_Handler,), {"token": self.token})
+        handler = type(
+            "_BoundHandler",
+            (_Handler,),
+            {"token": self.token, "context": self.context},
+        )
         self._server = ThreadingHTTPServer((self.bind_addr, 0), handler)
         # daemon=True so a wedged request can never keep the shim alive after the
         # container run it exists to serve has finished.
