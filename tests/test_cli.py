@@ -245,7 +245,101 @@ class TokenNeverEntersArgv(unittest.TestCase):
                             cli._dispatch(workspace, ["mono-control", "repo", "list"])
 
         self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["cmd"])
-        self.assertIsNone(seen["env"])  # inherit, exactly as before secrets existed
+        assert seen["env"] is not None
+        self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["env"])
+        # The env is no longer None, because the broker always contributes a secret of
+        # its own (see BrokerInjection). What must still hold is the property this test
+        # was written for: with no GitHub token, nothing about one reaches docker.
+
+
+class BrokerInjection(unittest.TestCase):
+    """The broker's coordinates reach the container; its token does so as a secret."""
+
+    def _capture(self, *, artifact: bool) -> tuple[list[str], dict[str, str] | None]:
+        seen: dict = {}
+
+        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+            seen["cmd"] = cmd
+            seen["env"] = env
+            return 0
+
+        workspace = mock.MagicMock(spec=cli.Path)
+        workspace.__truediv__.return_value.is_dir.return_value = not artifact
+        workspace.__truediv__.return_value.is_file.return_value = True
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(cli, "_exec", fake_exec):
+                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
+                    with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
+                        with mock.patch.object(cli, "_volume_args", return_value=[]):
+                            with mock.patch.object(
+                                cli.subprocess, "run", _gh_returning("")
+                            ):
+                                cli._dispatch(workspace, ["mono-control"], artifact=artifact)
+
+        return seen["cmd"], seen["env"]
+
+    def test_host_and_port_ride_the_plain_env_path(self) -> None:
+        cmd, _ = self._capture(artifact=False)
+        joined = " ".join(cmd)
+
+        self.assertIn(f"{cli.BROKER_HOST_ENV}={cli.BROKER_CONTAINER_HOST}", joined)
+        # The port is ephemeral, so assert the shape rather than a value.
+        port = next(a.split("=", 1)[1] for a in cmd if a.startswith(f"{cli.BROKER_PORT_ENV}="))
+        self.assertTrue(port.isdigit() and int(port) > 0)
+
+    def test_token_is_named_in_argv_but_valued_only_in_the_env(self) -> None:
+        cmd, env = self._capture(artifact=False)
+
+        self.assertIn(cli.BROKER_TOKEN_ENV, cmd)
+        assert env is not None
+        token = env[cli.BROKER_TOKEN_ENV]
+        self.assertTrue(token)
+        self.assertNotIn(token, " ".join(cmd))  # THE assertion, as for the GH token
+
+    def test_artifact_mode_injects_the_same_way(self) -> None:
+        cmd, env = self._capture(artifact=True)
+
+        self.assertNotIn("compose", cmd)  # sanity: really the artifact branch
+        self.assertIn(cli.BROKER_TOKEN_ENV, cmd)
+        assert env is not None
+        self.assertNotIn(env[cli.BROKER_TOKEN_ENV], " ".join(cmd))
+
+    def test_artifact_mode_maps_host_docker_internal_for_linux_hosts(self) -> None:
+        cmd, _ = self._capture(artifact=True)
+
+        self.assertIn("--add-host", cmd)
+        self.assertIn(f"{cli.BROKER_CONTAINER_HOST}:host-gateway", cmd)
+
+    def test_a_broker_that_cannot_bind_only_warns(self) -> None:
+        """Step 1 is additive: the command must still run without a broker."""
+        seen: dict = {}
+
+        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+            seen["cmd"] = cmd
+            return 0
+
+        def refuse_to_start(self) -> None:  # noqa: ANN001
+            raise OSError("address already in use")
+
+        workspace = mock.MagicMock(spec=cli.Path)
+        workspace.__truediv__.return_value.is_dir.return_value = True
+        workspace.__truediv__.return_value.is_file.return_value = True
+
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(cli.BrokerServer, "start", refuse_to_start):
+                with mock.patch.object(cli, "_exec", fake_exec):
+                    with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
+                        with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
+                            with mock.patch.object(cli, "_volume_args", return_value=[]):
+                                with contextlib.redirect_stderr(stderr):
+                                    rc = cli._dispatch(workspace, ["mono-control"])
+
+        self.assertEqual(rc, 0)  # the command still ran
+        self.assertIn("warning", stderr.getvalue().lower())
+        self.assertNotIn(cli.BROKER_TOKEN_ENV, seen["cmd"])
+        self.assertNotIn(cli.BROKER_PORT_ENV, " ".join(seen["cmd"]))
 
 
 if __name__ == "__main__":

@@ -42,9 +42,11 @@ deliberate security goal: less code on the host means a smaller attack surface.
   a token, and the container cannot get one — your host's lives in an OS keyring no
   Linux container can reach. The shim resolves one host-side and hands it in as
   `MONO_CONTROL_GITHUB_TOKEN` (see [GitHub token](#github-token)).
-- **Future: a gateway for host-level operations** that genuinely cannot run
-  inside the container (e.g. native Windows builds). This is the exception, not
-  the default — containerized execution stays preferred for security.
+- **Hosts a callback broker for host-level operations** that genuinely cannot run
+  inside the container. On every container run the shim stands up a local JSON-RPC
+  endpoint the container may call, and refuses anything not on an explicit verb
+  list (see [Host-callback broker](#host-callback-broker)). This is the exception,
+  not the default — containerized execution stays preferred for security.
 
 ## Design constraints
 
@@ -128,6 +130,46 @@ container a credential helper supplies it to git from the environment, scoped to
 `github.com` alone, and it is never written to disk. Full rationale: mono-control's
 [docs/design/github-auth.md](https://github.com/leith-bartrich/mono-control/blob/master/docs/design/github-auth.md).
 
+### Host-callback broker
+
+A few capabilities only the *host* has: a credential in an OS keyring, a native
+filesystem, git itself. Today those are pushed **into** the container (the GitHub
+token above). The broker is the inversion — the host keeps the capability and
+exposes a **narrow verb** the container may ask it to perform. The container then
+needs no token and no network, and host-only work stops crossing the bind-mount
+seam, where a 9p/drvfs translation makes some of it outright impossible.
+
+On every container run the shim binds a JSON-RPC 2.0 endpoint on an **ephemeral
+port on `127.0.0.1`**, mints a **fresh per-run token**, and passes both in:
+
+| variable            | value                     | how it is passed          |
+| ------------------- | ------------------------- | ------------------------- |
+| `MONO_BROKER_HOST`  | `host.docker.internal`    | `-e KEY=VALUE` (not secret) |
+| `MONO_BROKER_PORT`  | the bound ephemeral port  | `-e KEY=VALUE` (not secret) |
+| `MONO_BROKER_TOKEN` | per-run bearer token      | by name only, as the GitHub token is |
+
+The token is the security gate: it is compared with `hmac.compare_digest`, and a
+request that fails it gets a `401` with nothing else read or parsed. Requests are
+audited to stderr (method, auth result, outcome) — never the token itself. The
+audit logs at `WARNING`, so what you see unprompted is exactly the interesting
+part: a failed authentication or a refused method. For the full per-request trail:
+
+```python
+logging.getLogger("mono_control_shim.broker").setLevel(logging.INFO)
+```
+
+**The verb list is the whole contract.** Anything not registered is refused with
+JSON-RPC `-32601`. Today the list is deliberately trivial:
+
+```
+ping         -> "pong"
+broker.info  -> {"version": ..., "methods": [...]}
+```
+
+The broker is **best-effort**: if it cannot bind, the shim warns and runs the
+container without it. Nothing depends on it yet — semantic git/filesystem verbs,
+and making it required, come later.
+
 ## Tests
 
 Stdlib `unittest` — a test framework is a dependency like any other, and this repo
@@ -147,8 +189,10 @@ mono-control-shim/
 │   └── design/
 │       └── command-conventions.md   # the mproj command-naming pattern
 ├── tests/
-│   └── test_cli.py         # stdlib unittest; token resolution + secret plumbing
+│   ├── test_cli.py         # stdlib unittest; token resolution + secret plumbing
+│   └── test_broker.py      # broker auth, refusal and JSON-RPC taxonomy
 └── mono_control_shim/
     ├── __init__.py
+    ├── broker.py           # host-callback broker: transport + auth + verb dispatch
     └── cli.py              # argparse CLI: workspace resolution + artifact ops
 ```

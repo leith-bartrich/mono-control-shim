@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from mono_control_shim.broker import BrokerServer
+
 # A directory is recognized as a mono workspace when it contains the manifest
 # directory `mono-config/`. A `mono-control/` checkout may or may not sit beside
 # it; its presence selects dev vs. artifact execution (see `control`), not whether
@@ -57,6 +59,21 @@ GITHUB_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
 # The first is our own; the rest are the ecosystem's de-facto standards, honored so a
 # CI runner or an existing shell setup works without special-casing mono-control.
 _TOKEN_ENV_VARS = (GITHUB_TOKEN_ENV, "GH_TOKEN", "GITHUB_TOKEN")
+
+# Host-callback broker coordinates carried into the container (see broker.py). Same
+# shape as the two above — host-side knowledge the container cannot derive — split
+# by sensitivity: the host and port are not secret and ride the `-e KEY=VALUE` path,
+# while the per-run token is a SECRET and takes the same valueless-`-e` route as the
+# GitHub token, so it never appears in argv.
+#
+# `host.docker.internal` is the name Docker Desktop gives the host from inside a
+# container. The shim names it rather than an address because the address is not
+# stable across Docker networks, and the container has no way to learn either.
+BROKER_HOST_ENV = "MONO_BROKER_HOST"
+BROKER_PORT_ENV = "MONO_BROKER_PORT"
+BROKER_TOKEN_ENV = "MONO_BROKER_TOKEN"
+
+BROKER_CONTAINER_HOST = "host.docker.internal"
 
 _GH_FALLBACK_WARNING = (
     f"warning: no {GITHUB_TOKEN_ENV} set; falling back to your `gh` OAuth token.\n"
@@ -332,22 +349,53 @@ def _dispatch(
     if token:
         secrets[GITHUB_TOKEN_ENV] = token
 
-    if (workspace / "mono-control").is_dir() and not artifact:
-        return _dev_run(
-            docker, workspace, inner_argv, build=build, env=env, secrets=secrets
-        )
-    if dev_only:
+    # Stand up the host-callback broker for the lifetime of the container run, so the
+    # container can ask the host to do the few things only the host can (see broker.py).
+    # It is BEST-EFFORT in Step 1: nothing depends on it yet, so a failure to bind must
+    # not turn a working command into a broken one. Warn and run without it.
+    broker: BrokerServer | None = None
+    try:
+        broker = BrokerServer()
+        broker.start()
+    except OSError as e:
         print(
-            "error: this operation requires a mono-control/ checkout (dev mode).",
+            f"warning: host-callback broker could not start ({e}); "
+            "running without it.",
             file=sys.stderr,
         )
-        return 1
-    if build:
-        print(
-            "warning: --build has no effect in artifact mode (no mono-control source).",
-            file=sys.stderr,
-        )
-    return _artifact_run(docker, workspace, inner_argv, env=env, secrets=secrets)
+        broker = None
+
+    if broker is not None:
+        # Coordinates are not secret — they are useless without the token — so they
+        # take the ordinary `-e KEY=VALUE` path...
+        env[BROKER_HOST_ENV] = BROKER_CONTAINER_HOST
+        env[BROKER_PORT_ENV] = str(broker.port)
+        # ...and the token takes the GitHub token's route: named in argv, valued only
+        # in the environment handed to docker.
+        secrets[BROKER_TOKEN_ENV] = broker.token
+
+    try:
+        if (workspace / "mono-control").is_dir() and not artifact:
+            return _dev_run(
+                docker, workspace, inner_argv, build=build, env=env, secrets=secrets
+            )
+        if dev_only:
+            print(
+                "error: this operation requires a mono-control/ checkout (dev mode).",
+                file=sys.stderr,
+            )
+            return 1
+        if build:
+            print(
+                "warning: --build has no effect in artifact mode (no mono-control source).",
+                file=sys.stderr,
+            )
+        return _artifact_run(docker, workspace, inner_argv, env=env, secrets=secrets)
+    finally:
+        # The broker's authority is scoped to exactly one container run. Ending it here
+        # means the token dies with the command that issued it.
+        if broker is not None:
+            broker.stop()
 
 
 def _secret_args(secrets: dict[str, str] | None) -> list[str]:
@@ -443,6 +491,11 @@ def _artifact_run(
         docker, "run", "--rm",
         "-e", "MONO_CONTROL_IN_CONTAINER=1",
         "-w", "/workspaces/mono-control",
+        # Make `host.docker.internal` (the broker's address from inside the container)
+        # resolve on native-Linux hosts too. Docker Desktop provides the name itself
+        # and accepts this redundantly, so it is unconditional rather than conditioned
+        # on a host-platform check we would then have to keep true.
+        "--add-host", "host.docker.internal:host-gateway",
     ]
     for key, value in (env or {}).items():
         cmd += ["-e", f"{key}={value}"]
