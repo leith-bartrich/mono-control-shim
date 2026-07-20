@@ -16,7 +16,9 @@ import contextlib
 import io
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from mono_control_shim import cli
@@ -167,71 +169,91 @@ class SecretPlumbing(unittest.TestCase):
         self.assertIsNone(cli._secret_environ(None))
 
 
-class TokenNeverEntersArgv(unittest.TestCase):
-    """The end-to-end property, asserted on the real command lines both backends build.
+class GitHubTokenStaysOnTheHost(unittest.TestCase):
+    """The GitHub token is no longer handed to the container at all.
 
-    argv is readable by any local process, so a token there would be a worse leak than
-    the prompt this whole change exists to remove.
+    The broker now performs every git effect on the host and holds the token itself
+    (in the ``HostContext``). So the shim must resolve the token — and still feed it to
+    the ``HostContext`` — but must NOT name it to docker: no ``-e MONO_CONTROL_GITHUB_TOKEN``
+    on either backend's command line, and (since it is not forwarded) nothing about it in
+    the environment handed to docker either.
     """
 
-    def _capture(self, *, artifact: bool) -> tuple[list[str], dict[str, str] | None]:
+    def _capture(
+        self, *, artifact: bool
+    ) -> tuple[list[str], dict[str, str] | None, str | None]:
         seen: dict = {}
 
         def fake_exec(cmd, *, env=None):  # noqa: ANN001
             seen["cmd"] = cmd
             seen["env"] = env
             return 0
+
+        real_hostcontext = cli.HostContext
+
+        def capturing_hostcontext(**kwargs):  # noqa: ANN003
+            seen["host_token"] = kwargs.get("github_token")
+            return real_hostcontext(**kwargs)
 
         workspace = mock.MagicMock(spec=cli.Path)
         # `workspace / "mono-control"` -> a path whose .is_dir() selects the backend.
         workspace.__truediv__.return_value.is_dir.return_value = not artifact
         workspace.__truediv__.return_value.is_file.return_value = True
 
-        env = {cli.GITHUB_TOKEN_ENV: TOKEN}
-        with mock.patch.dict(os.environ, env, clear=True):
+        # Source the token from the `gh` fallback rather than an env var, so it never
+        # sits in this process's environment — then the env handed to docker can be
+        # asserted clean of it, not merely un-injected. (redirect the fallback warning.)
+        stderr = io.StringIO()
+        with _no_env():
             with mock.patch.object(cli, "_exec", fake_exec):
-                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
+                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/x"):
                     with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
-                        with mock.patch.object(cli, "_volume_args", return_value=[]):
+                        with mock.patch.object(cli, "HostContext", capturing_hostcontext):
                             with mock.patch.object(
-                                cli.subprocess,
-                                "run",
-                                _gh_returning(""),  # image-inspect probe: exit 0 = present
+                                cli.subprocess, "run", _gh_returning(TOKEN + "\n")
                             ):
-                                cli._dispatch(workspace, ["mono-control", "repo", "list"],
-                                              artifact=artifact)
+                                with contextlib.redirect_stderr(stderr):
+                                    cli._dispatch(
+                                        workspace, ["mono-control", "repo", "list"],
+                                        artifact=artifact,
+                                    )
 
-        return seen["cmd"], seen["env"]
+        return seen["cmd"], seen["env"], seen.get("host_token")
 
-    def test_dev_mode_passes_token_by_name_only(self) -> None:
-        cmd, env = self._capture(artifact=False)
+    def test_dev_mode_does_not_hand_the_token_to_the_container(self) -> None:
+        cmd, env, host_token = self._capture(artifact=False)
 
         self.assertIn("compose", cmd)  # sanity: we really took the dev branch
-        self.assertNotIn(TOKEN, " ".join(cmd))  # THE assertion
-        self.assertEqual(
-            [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e" and cmd[i + 1] == cli.GITHUB_TOKEN_ENV],
-            [cli.GITHUB_TOKEN_ENV],
-        )
+        self.assertNotIn(TOKEN, " ".join(cmd))  # never in argv
+        self.assertNotIn(cli.GITHUB_TOKEN_ENV, cmd)  # ...and not named as a -e flag
         assert env is not None
-        self.assertEqual(env[cli.GITHUB_TOKEN_ENV], TOKEN)  # ...it rides in the env
+        self.assertNotIn(cli.GITHUB_TOKEN_ENV, env)  # ...nor forwarded via docker's env
+        self.assertEqual(host_token, TOKEN)  # but the broker's HostContext DID get it
 
-    def test_artifact_mode_passes_token_by_name_only(self) -> None:
-        cmd, env = self._capture(artifact=True)
+    def test_artifact_mode_does_not_hand_the_token_to_the_container(self) -> None:
+        cmd, env, host_token = self._capture(artifact=True)
 
         self.assertIn("run", cmd)
         self.assertNotIn("compose", cmd)  # sanity: we really took the artifact branch
-        self.assertNotIn(TOKEN, " ".join(cmd))  # THE assertion
-        self.assertIn(cli.GITHUB_TOKEN_ENV, cmd)
+        self.assertNotIn(TOKEN, " ".join(cmd))
+        self.assertNotIn(cli.GITHUB_TOKEN_ENV, cmd)
         assert env is not None
-        self.assertEqual(env[cli.GITHUB_TOKEN_ENV], TOKEN)
+        self.assertNotIn(cli.GITHUB_TOKEN_ENV, env)
+        self.assertEqual(host_token, TOKEN)
 
-    def test_no_token_leaves_the_command_line_untouched(self) -> None:
+    def test_no_token_is_a_normal_state_and_reaches_the_host_context_as_none(self) -> None:
         seen: dict = {}
 
         def fake_exec(cmd, *, env=None):  # noqa: ANN001
             seen["cmd"] = cmd
             seen["env"] = env
             return 0
+
+        real_hostcontext = cli.HostContext
+
+        def capturing_hostcontext(**kwargs):  # noqa: ANN003
+            seen["host_token"] = kwargs.get("github_token")
+            return real_hostcontext(**kwargs)
 
         workspace = mock.MagicMock(spec=cli.Path)
         workspace.__truediv__.return_value.is_dir.return_value = True
@@ -241,15 +263,16 @@ class TokenNeverEntersArgv(unittest.TestCase):
             with mock.patch.object(cli, "_exec", fake_exec):
                 with mock.patch.object(cli.shutil, "which", side_effect=lambda n: None if n == "gh" else "/usr/bin/docker"):
                     with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
-                        with mock.patch.object(cli, "_volume_args", return_value=[]):
+                        with mock.patch.object(cli, "HostContext", capturing_hostcontext):
                             cli._dispatch(workspace, ["mono-control", "repo", "list"])
 
         self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["cmd"])
         assert seen["env"] is not None
         self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["env"])
-        # The env is no longer None, because the broker always contributes a secret of
-        # its own (see BrokerInjection). What must still hold is the property this test
-        # was written for: with no GitHub token, nothing about one reaches docker.
+        self.assertIsNone(seen.get("host_token"))  # no token is a normal state
+        # The env is no longer None because the broker always contributes a secret of
+        # its own (see BrokerInjection); what still holds is that nothing about a GitHub
+        # token reaches docker.
 
 
 class BrokerInjection(unittest.TestCase):
@@ -271,7 +294,7 @@ class BrokerInjection(unittest.TestCase):
             with mock.patch.object(cli, "_exec", fake_exec):
                 with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
                     with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
-                        with mock.patch.object(cli, "_volume_args", return_value=[]):
+                        with mock.patch.object(cli, "_warn_if_workspace_incomplete", return_value=None):
                             with mock.patch.object(
                                 cli.subprocess, "run", _gh_returning("")
                             ):
@@ -332,7 +355,7 @@ class BrokerInjection(unittest.TestCase):
                 with mock.patch.object(cli, "_exec", fake_exec):
                     with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
                         with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
-                            with mock.patch.object(cli, "_volume_args", return_value=[]):
+                            with mock.patch.object(cli, "_warn_if_workspace_incomplete", return_value=None):
                                 with contextlib.redirect_stderr(stderr):
                                     rc = cli._dispatch(workspace, ["mono-control"])
 
@@ -340,6 +363,84 @@ class BrokerInjection(unittest.TestCase):
         self.assertIn("warning", stderr.getvalue().lower())
         self.assertNotIn(cli.BROKER_TOKEN_ENV, seen["cmd"])
         self.assertNotIn(cli.BROKER_PORT_ENV, " ".join(seen["cmd"]))
+
+
+class WorkspaceDirsAreNotMounted(unittest.TestCase):
+    """The managed workspace dirs are no longer bind-mounted into the container.
+
+    The broker performs git/FS effects on those host paths directly, so the container
+    no longer needs them mounted. What survives is the dev-mode live-source and uv-cache
+    mounts, and the "run `mproj init`" hint when a required dir is missing.
+    """
+
+    def _dev_cmd(self, workspace: Path) -> tuple[list[str], str]:
+        """Run a dev-mode dispatch against a real *workspace*, capturing cmd + stderr."""
+        seen: dict = {}
+
+        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+            seen["cmd"] = cmd
+            return 0
+
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(cli, "_exec", fake_exec):
+                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
+                    with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
+                        with contextlib.redirect_stderr(stderr):
+                            cli._dispatch(workspace, ["mono-control"])
+        return seen["cmd"], stderr.getvalue()
+
+    def _make_workspace(self, tmp: str, *, init_dirs: bool) -> Path:
+        workspace = Path(tmp)
+        compose = workspace / "mono-control" / ".devcontainer" / "docker-compose.yml"
+        compose.parent.mkdir(parents=True)
+        compose.write_text("services: {}\n", encoding="utf-8")
+        if init_dirs:
+            for name in cli.INIT_DIRS:
+                (workspace / name).mkdir()
+        return workspace
+
+    def test_complete_workspace_mounts_only_source_and_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(tmp, init_dirs=True)
+            cmd, stderr = self._dev_cmd(workspace)
+
+        mounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
+        # The two dev-mode mounts survive...
+        self.assertTrue(any(m.endswith(":/workspaces/mono-control") for m in mounts))
+        self.assertTrue(any(m.endswith(":/home/codespace/.cache/uv") for m in mounts))
+        # ...but none of the managed workspace dirs are mounted anymore.
+        for name in cli.INIT_DIRS:
+            self.assertFalse(
+                any(m.endswith(f":/workspaces/{name}") for m in mounts),
+                f"{name} should no longer be bind-mounted",
+            )
+        self.assertNotIn("warning", stderr.lower())  # nothing missing, nothing to warn
+
+    def test_missing_workspace_dir_still_warns_but_does_not_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._make_workspace(tmp, init_dirs=True)
+            # Drop one managed dir: the hint must fire, the mount must NOT reappear.
+            (workspace / "mono-repos-offline").rmdir()
+            cmd, stderr = self._dev_cmd(workspace)
+
+        mounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
+        self.assertFalse(any(m.endswith(":/workspaces/mono-repos-offline") for m in mounts))
+        self.assertIn("warning", stderr.lower())
+        self.assertIn("mono-repos-offline", stderr)
+        self.assertIn("mproj init", stderr)
+
+    def test_warn_helper_is_silent_when_all_dirs_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            for name in cli.INIT_DIRS:
+                (workspace / name).mkdir()
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                result = cli._warn_if_workspace_incomplete(workspace)
+
+        self.assertIsNone(result)  # pure existence check, contributes no -v flags
+        self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

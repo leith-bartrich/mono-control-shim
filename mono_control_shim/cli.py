@@ -241,11 +241,11 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
     return True, "docker daemon reachable and .devcontainer config present"
 
 
-# Directories that `mproj init` ensures exist in the workspace root. These are
-# the bind-mount sources the mono-control container expects to find. They MUST be
-# host-side dirs (not container-local): mono-repos-offline in particular is the
-# non-destructive retire holding area, so leaving it unmounted would lose unpushed
-# work — and under `docker compose run --rm` it would vanish after every call.
+# Directories that `mproj init` ensures exist in the workspace root. The broker acts
+# on these host-side dirs directly (they feed the HostContext), so they are no longer
+# bind-mounted into the container, but they MUST still exist on the host: mono-repos is
+# the materialized root, mono-repos-offline the non-destructive retire holding area
+# (whose unpushed work would be lost if it were absent), and mono-config the manifest dir.
 INIT_DIRS = ("mono-repos", "mono-repos-offline", "mono-config")
 
 
@@ -285,19 +285,19 @@ def _run_init(workspace: Path) -> int:
     return 0
 
 
-def _volume_args(workspace: Path) -> list[str]:
-    """Per-call bind mounts for the managed workspace dirs.
+def _warn_if_workspace_incomplete(workspace: Path) -> None:
+    """Warn (and suggest `mproj init`) for any missing managed workspace dir.
 
-    The container-side targets are fixed (they match src/mono_control/paths.py in
-    mono-control); only the host sources vary per invocation.
+    The broker now performs git/FS effects on these host paths directly (they feed
+    the ``HostContext``), so they are no longer bind-mounted into the container.
+    But they must still EXIST on the host for the broker to work, so the
+    missing-dir hint that used to ride along with the (now removed) bind mounts is
+    preserved here as a pure existence check that mounts nothing.
     """
-    args: list[str] = []
     for name in INIT_DIRS:  # mono-repos, mono-repos-offline, mono-config
         source = workspace / name
         if not source.is_dir():
             print(f"warning: {source} does not exist; run `mproj init`.", file=sys.stderr)
-        args += ["-v", f"{source}:/workspaces/{name}"]
-    return args
 
 
 # Persistent uv cache volume so repeated `--rm` runs (e.g. test-control) don't
@@ -341,14 +341,13 @@ def _dispatch(
     env = {**(env or {}), HOST_PLATFORM_ENV: host_platform}
 
     # The shim is likewise the host-side authority for the GitHub credential, for the
-    # same reason: the container cannot reach the host keyring. But a token is a
-    # SECRET, so it does NOT join `env` above — that dict becomes `-e KEY=VALUE` on the
-    # command line, and argv is world-readable. Secrets are passed by name only; see
-    # `_secret_args` / `_secret_environ`. No token is a normal state, not an error.
+    # same reason: the container cannot reach the host keyring. It is no longer handed
+    # to the container at all — the broker now performs every git effect on the host and
+    # holds this token itself (see the HostContext below). We still resolve it here (and
+    # warn on the `gh` fallback) precisely to feed that HostContext. No token is a normal
+    # state, not an error.
     secrets: dict[str, str] = {}
     token = _resolve_github_token()
-    if token:
-        secrets[GITHUB_TOKEN_ENV] = token
 
     # Stand up the host-callback broker for the lifetime of the container run, so the
     # container can ask the host to do the few things only the host can (see broker.py).
@@ -357,9 +356,9 @@ def _dispatch(
     #
     # Importing the verb packs is what registers their handlers (@verb runs at import);
     # the host context carries the host paths + token those handlers act on — knowledge
-    # the container cannot have and must not be handed. The paths mirror the bind-mount
-    # sources in `_volume_args` (INIT_DIRS): mono-repos is the materialized root,
-    # mono-repos-offline the offline holding area, mono-config the manifest dir.
+    # the container cannot have and must not be handed. The paths are the managed
+    # workspace dirs (INIT_DIRS): mono-repos is the materialized root, mono-repos-offline
+    # the offline holding area, mono-config the manifest dir.
     from mono_control_shim import verbs  # noqa: F401  (import = register packs)
 
     host_context = HostContext(
@@ -473,10 +472,12 @@ def _dev_run(
         cmd += ["-e", f"{key}={value}"]
     cmd += _secret_args(secrets)
     # Mount live source over the baked copy so working-tree edits are reflected,
-    # plus a persistent uv cache so repeated runs don't re-download deps.
+    # plus a persistent uv cache so repeated runs don't re-download deps. The managed
+    # workspace dirs (mono-repos / -offline / mono-config) are NOT mounted: the broker
+    # touches them on the host. Still warn if they are missing — the broker needs them.
     cmd += ["-v", f"{workspace / 'mono-control'}:/workspaces/mono-control"]
     cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
-    cmd += _volume_args(workspace)
+    _warn_if_workspace_incomplete(workspace)
     cmd += ["mono-control", *inner_argv]  # compose service name, then the command
     # Only thread stdout_path when capturing (json-schema-control), so the ordinary
     # streaming call shape is byte-for-byte unchanged.
@@ -529,7 +530,9 @@ def _artifact_run(
         # No pseudo-TTY when capturing stdout to a file: `-t` would inject terminal
         # control bytes and corrupt the JSON we are trying to save.
         cmd.append("-it")  # interactive (e.g. mono-control repl / shell-control)
-    cmd += _volume_args(workspace)
+    # The managed workspace dirs are not mounted (the broker touches them on the host);
+    # still warn if any is missing, since the broker needs them present.
+    _warn_if_workspace_incomplete(workspace)
     cmd += [MONO_CONTROL_IMAGE, *inner_argv]
     extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
     return _exec(cmd, env=_secret_environ(secrets), **extra)
