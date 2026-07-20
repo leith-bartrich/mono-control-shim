@@ -15,15 +15,43 @@ against a local bare repo too — no test reaches the network.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mono_control_shim import broker
 from mono_control_shim.broker import HostContext, VerbError
 from mono_control_shim.verbs import git
+
+
+def _fake_rename(*, exdev_for: Path, eacces_on_publish: bool):
+    """A stand-in for ``os.rename`` that reproduces the drvfs move failure.
+
+    Native NTFS/Linux cannot reproduce the original bug, so the exact errnos are
+    injected: ``EXDEV`` on the initial ``src -> dst`` rename forces ``_move`` down
+    its cross-filesystem copytree+publish branch (as separate 9p/drvfs mounts did
+    in the container), and — when ``eacces_on_publish`` — ``EACCES`` on the atomic
+    publish of ``.<name>.tmp-move -> <name>`` reproduces drvfs's refusal to
+    ``rename()`` a tree containing a read-only file (git packfiles are mode 0444).
+    Every other rename (including the temp->dst publish when not refusing) passes
+    through to the real syscall.
+    """
+    real_rename = os.rename
+
+    def fake_rename(a, b):
+        source = Path(a)
+        if source == exdev_for:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if eacces_on_publish and source.name.endswith(".tmp-move"):
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_rename(a, b)
+
+    return fake_rename
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -323,6 +351,102 @@ class CredentialHardening(unittest.TestCase):
     def test_network_env_without_https_only_leaves_protocol_unrestricted(self) -> None:
         env = git._network_env("tok")
         self.assertNotIn("GIT_ALLOW_PROTOCOL", env)
+
+
+class MoveDrvfsRegression(GitVerbsCase):
+    """Regression for the drvfs ``EACCES``-on-move bug that started this project.
+
+    On a Windows host, ``mono-repos/`` and ``mono-repos-offline/`` were bind-mounted
+    into the container over 9p/drvfs. drvfs refuses to ``rename()`` a directory tree
+    that contains a read-only file (git packfiles are mode 0444), so the layout
+    engine's cross-device move failed with ``[Errno 13] EACCES`` when publishing
+    ``.<name>.tmp-move -> <name>``. Re-hosting the move onto the host's own
+    filesystem (this pack's ``_move``) fixes it by construction, but nothing in the
+    suite reproduced the failure mode — so it shipped and bit.
+
+    Native NTFS/Linux won't reproduce it, so these tests model it by monkeypatching
+    ``os.rename`` (via ``git.os``, exactly as the deleted container test
+    ``mono-control/tests/test_layout_move.py`` monkeypatched ``execute.os.rename``)
+    to raise the exact original errnos. The key assertion is that the ``place`` verb
+    turns the refusal into a structured ``{"status": "failed", ...}`` outcome, never
+    an unhandled traceback across the wire.
+    """
+
+    def test_place_surfaces_drvfs_publish_eacces_as_a_failed_outcome(self) -> None:
+        # A real acquired offline checkout (with the read-only git objects that make
+        # drvfs refuse the rename in the first place).
+        self._acquire_offline("proj")
+        src = self.offline / "proj"
+
+        # EXDEV forces the copytree+publish branch; EACCES on the publish is the
+        # exact original failure.
+        patched = _fake_rename(exdev_for=src, eacces_on_publish=True)
+        with mock.patch.object(git.os, "rename", patched):
+            out = git._place({"slug": "proj", "location": "cluster/proj"}, self.ctx)
+
+        # A structured failure, not a crash: a dict outcome with a clear summary.
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("place", out["summary"])
+        self.assertIn("proj", out["summary"])
+        self.assertIn("Permission denied", out["summary"])
+        # The publish never completed: source intact, destination never created.
+        self.assertTrue((self.offline / "proj" / ".git").exists())
+        self.assertFalse((self.workspace / "cluster" / "proj").exists())
+
+    def test_move_publish_rename_eacces_propagates_as_oserror(self) -> None:
+        # ``_move`` directly: it must surface the publish refusal as the OSError
+        # family the verbs catch — not swallow it, not leave a half-published dst.
+        src = Path(self._tmp.name) / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "f.txt").write_text("hi\n")
+        (src / "sub" / "g.txt").write_text("nested\n")
+        dst = self.workspace / "landed"
+
+        patched = _fake_rename(exdev_for=src, eacces_on_publish=True)
+        with mock.patch.object(git.os, "rename", patched):
+            with self.assertRaises(OSError) as cm:
+                git._move(src, dst)
+
+        self.assertEqual(cm.exception.errno, errno.EACCES)
+        self.assertFalse(dst.exists())  # publish never happened
+        self.assertTrue((src / "f.txt").exists())  # source left intact
+
+    def test_move_copy_branch_carries_a_readonly_file(self) -> None:
+        # The native-host behavior the fix relies on: drvfs refused to *rename* a
+        # tree containing a read-only file, but ``copytree(symlinks=True)`` copies
+        # read-only files fine, so the copy+publish branch succeeds where the OS
+        # permits it.
+        src = Path(self._tmp.name) / "ro-src"
+        (src / "sub").mkdir(parents=True)
+        (src / "sub" / "g.txt").write_text("nested\n")
+        packish = src / "pack.idx"  # a git-packfile-like read-only file (mode 0444)
+        packish.write_text("packdata\n")
+        os.chmod(packish, 0o444)
+        dst = self.workspace / "landed"
+
+        # EXDEV only: force the copy branch, then let the temp->dst publish through.
+        patched = _fake_rename(exdev_for=src, eacces_on_publish=False)
+        moved = True
+        with mock.patch.object(git.os, "rename", patched):
+            try:
+                git._move(src, dst)
+            except OSError as e:
+                # Windows refuses to unlink the read-only file during ``_move``'s
+                # final ``rmtree(src)`` cleanup (a platform quirk unrelated to the
+                # copy, which already published ``dst``); POSIX hosts remove it fine.
+                if not (os.name == "nt" and e.errno == errno.EACCES):
+                    raise
+                moved = False
+
+        # Load-bearing: copytree replicated the read-only file and the publish put
+        # it in place, mode preserved (symlinks=True), temp dir consumed.
+        landed = dst / "pack.idx"
+        self.assertEqual(landed.read_text(), "packdata\n")
+        self.assertFalse(os.access(landed, os.W_OK))  # still read-only
+        self.assertEqual((dst / "sub" / "g.txt").read_text(), "nested\n")
+        self.assertFalse((dst.parent / f".{dst.name}.tmp-move").exists())
+        if moved:  # POSIX: the whole move completed and the source is gone
+            self.assertFalse(src.exists())
 
 
 if __name__ == "__main__":
