@@ -277,13 +277,13 @@ class WorkspaceDirsAreNotMounted(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = self._make_workspace(tmp, init_dirs=True)
             # Drop one managed dir: the hint must fire, the mount must NOT reappear.
-            (workspace / "mono-repos-offline").rmdir()
+            (workspace / "mono-repos-bare").rmdir()
             cmd, stderr = self._dev_cmd(workspace)
 
         mounts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-v"]
-        self.assertFalse(any(m.endswith(":/workspaces/mono-repos-offline") for m in mounts))
+        self.assertFalse(any(m.endswith(":/workspaces/mono-repos-bare") for m in mounts))
         self.assertIn("warning", stderr.lower())
-        self.assertIn("mono-repos-offline", stderr)
+        self.assertIn("mono-repos-bare", stderr)
         self.assertIn("mproj init", stderr)
 
     def test_warn_helper_is_silent_when_all_dirs_present(self) -> None:
