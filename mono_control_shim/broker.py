@@ -4,16 +4,16 @@ Why this exists
 ---------------
 The shim's premise is that rich tooling belongs in a container, away from the host.
 That isolation is one-directional, though: a few capabilities *only* the host has —
-a credential in an OS keyring, a native filesystem, git itself — cannot be moved
-into the container without dragging their liability along. Today those are pushed
-inward (a token handed across the seam by `cli.GITHUB_TOKEN_ENV`). The broker is
+its git credential machinery, a native filesystem, git itself — cannot be moved
+into the container without dragging their liability along. The old design pushed
+those inward (a token handed across the seam into the container). The broker is
 the inversion: instead of shipping the *capability* into the container, the host
 keeps it and exposes a **narrow verb** the container may ask it to perform.
 
-That is strictly better on two axes. The container ends up holding no token and
-needing no network; and host-only work (native git on a native filesystem) stops
-crossing the bind-mount seam, where a 9p/drvfs translation makes some of it simply
-impossible.
+That is strictly better on two axes. The container ends up holding no credential
+and needing no network; and host-only work (native git on a native filesystem)
+stops crossing the bind-mount seam, where a 9p/drvfs translation makes some of it
+simply impossible. Host git runs as the developer and resolves credentials itself.
 
 This module is **Step 1**: transport, auth, and dispatch — and nothing else. The
 only verbs are ``ping`` and ``broker.info``. Everything else is **refused**. The
@@ -119,21 +119,18 @@ class HostContext:
 
     Step 1's verbs (``ping`` / ``broker.info``) are pure and need nothing here.
     Step 2's verbs act on the host filesystem and network, so they need to know
-    *which* host paths and *which* credential — knowledge the container cannot
-    have and must not be handed. ``cli._dispatch`` already resolves the workspace
-    root and the GitHub token; it builds one of these and hands it to
-    :class:`BrokerServer`, which threads it to every handler.
+    *which* host paths — knowledge the container cannot have and must not be
+    handed. ``cli._dispatch`` resolves the workspace root, builds one of these,
+    and hands it to :class:`BrokerServer`, which threads it to every handler.
 
-    The token lives here and nowhere on the wire: it is a host secret the verbs
-    consume, never a value the broker echoes back. It is never logged (the audit
-    line records method + outcome only), and reaches ``git`` through a credential
-    helper via the environment, never on argv.
+    No credential lives here: the git verbs run host git *as the developer*, so
+    the host's own git credential machinery (gh helper, Git Credential Manager,
+    OS keyring, ``~/.gitconfig``) supplies any token. The broker injects nothing.
     """
 
     workspace_root: Path
     offline_root: Path
     config_dir: Path
-    github_token: Optional[str] = None
 
 
 class VerbError(Exception):

@@ -7,7 +7,7 @@ clone/init/fetch decision tree, ``engines/layout/execute.py``'s move, and
 and ``mono-control/tests/broker_shim.py`` — the in-process fake the container's
 whole suite passes against. These verbs perform the *same* operations with the
 *same* request/response shapes, differing only in that they run against the real
-host paths + token + hardened ``git`` rather than a temp fixture.
+host paths and host git rather than a temp fixture.
 
 Why native, not in the container: git and ``os.rename`` here run on the host's
 own filesystem (NTFS), so the move never crosses the 9p/drvfs bind-mount seam —
@@ -25,11 +25,16 @@ so every verb validates at the boundary before it touches disk or spawns git:
 * ``remote_default_branch``'s URL comes from the container (guided-add is still
   *defining* the remote), so its scheme is allow-listed to ``https`` and git is
   run under ``GIT_ALLOW_PROTOCOL=https`` — no ``file://`` / ``ext::`` side
-  channels — with the token scoped to ``github.com`` by the credential helper.
+  channels.
 
-The token never appears on argv: it is handed to git through a credential helper
-that reads it from the environment (the same ``git-credential-mono`` pattern the
-container's Dockerfile bakes), and it is never logged.
+Credentials are the host's, not ours. Git here runs host-side *as the developer*,
+so it inherits the host's own credential machinery (gh helper, Git Credential
+Manager, OS keyring, ``~/.gitconfig``). The broker injects no token and no
+credential helper. What it *does* enforce is a strictly non-interactive posture
+(``GIT_TERMINAL_PROMPT=0`` plus ``credential.interactive=false``) so a network op
+with no usable credential fails fast — on every platform — instead of hanging on a
+TTY prompt or a GUI popup; the failure is then reworded into an actionable
+"set up gh / a credential helper" summary (see ``is_auth_failure``).
 """
 
 from __future__ import annotations
@@ -66,31 +71,48 @@ _PROFILE_KEYS = (
     ("core.ignorecase", "ignorecase"),
 )
 
-# The environment variable the credential helper reads the token from. Named, not
-# valued, on the git command line — the value only ever lives in the child's
-# environment, never in argv (which is world-readable via the process table).
-_GIT_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
-
-# A github.com-scoped credential helper, supplied inline via ``git -c`` so nothing
-# is written to any ``.git/config`` on the host (an embedded-token ``insteadOf``
-# would persist the secret in every clone's config, which lives on the host). It
-# mirrors the container's baked ``git-credential-mono``: on ``get`` it emits the
-# token as the password for ``x-access-token``, and stays silent otherwise. The
-# ``$MONO_CONTROL_GITHUB_TOKEN`` here is a literal in argv — git's own shell
-# expands it from the environment at call time.
-_CREDENTIAL_HELPER = (
-    "!f() { "
-    'test "$1" = get || exit 0; '
-    'test -n "$MONO_CONTROL_GITHUB_TOKEN" || exit 0; '
-    "echo username=x-access-token; "
-    'echo "password=$MONO_CONTROL_GITHUB_TOKEN"; '
-    "}; f"
-)
-
 # URL schemes the container is allowed to have the host probe. HTTPS only: a repo
 # definition is data, and a mistyped or malicious URL must never make git open a
 # local file, an ssh session, or a transport helper.
 _ALLOWED_URL_SCHEMES = frozenset({"https"})
+
+# stderr substrings (matched case-insensitively) that mark a git network failure as
+# an auth / credential problem — as opposed to a missing repo, a DNS failure, or a
+# refused connection. Adapted for the host-side reality: with the non-interactive
+# posture below, a private remote with no usable credential fails with one of these
+# rather than hanging on a prompt.
+AUTH_MARKERS = (
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "terminal prompts disabled",
+    "invalid username or password",
+    "support for password authentication was removed",
+    "the requested url returned error: 403",
+    "error: 403",
+    "remote: permission to",
+    "remote: repository not found",
+)
+
+# The actionable hint appended to an auth failure. Reworded for host-side git: the
+# fix is no longer "export a token for the container" but "give host git a credential".
+_AUTH_HINT = (
+    "git runs on the host now and found no usable GitHub credential. Set one up on "
+    "the host — run `gh auth login` (easiest; makes gh git's credential helper), or "
+    "configure a credential helper / fine-grained PAT for github.com."
+)
+
+
+def is_auth_failure(stderr: str) -> bool:
+    """True when *stderr* (or a ``GitError`` message wrapping it) looks like an
+    auth / credential failure rather than any other network error."""
+    low = stderr.lower()
+    return any(marker in low for marker in AUTH_MARKERS)
+
+
+def _auth_summary(target: str) -> str:
+    """The actionable summary for an auth failure against *target* (a slug or URL)."""
+    return f"authentication failed for {target}: {_AUTH_HINT}"
 
 
 # --------------------------------------------------------------------------- #
@@ -142,8 +164,8 @@ def run_git(
 
     List-form args only — never a shell string — so a URL or ref can never be
     reinterpreted by a shell. ``config`` holds ``-c key=value`` pairs that must
-    precede the subcommand (e.g. the credential helper). A non-zero exit raises
-    ``GitError`` with stderr; a missing binary raises ``GitError`` too.
+    precede the subcommand (e.g. the non-interactive posture). A non-zero exit
+    raises ``GitError`` with stderr; a missing binary raises ``GitError`` too.
     """
     command = ["git", *(config or []), *args]
     try:
@@ -158,38 +180,37 @@ def run_git(
     except FileNotFoundError as e:  # pragma: no cover - git present in CI
         raise GitError("git executable not found on PATH") from e
     if result.returncode != 0:
-        # stderr, not the token: network git runs with the helper, whose value is
-        # a script referencing an env var by name, so no secret is in the command.
+        # No secret to redact: the broker injects no token — host git supplies its
+        # own credential — so the raw stderr is safe to surface (and is what the
+        # auth classifier reads).
         raise GitError(f"`git {' '.join(args)}` failed: {result.stderr.strip()}")
     return result.stdout.strip()
 
 
-def _credential_config(token: Optional[str]) -> list[str]:
-    """``-c`` flags registering the github.com credential helper, or nothing.
-
-    Clears any inherited helper for the host first (so only ours can answer), then
-    registers ours. No token → no helper: a public remote needs none, and the
-    absence keeps git from having anything to offer.
-    """
-    if not token:
-        return []
-    return [
-        "-c", "credential.https://github.com.helper=",
-        "-c", "credential.https://github.com.helper=" + _CREDENTIAL_HELPER,
-    ]
+# ``-c`` config that makes a git call strictly non-interactive on the credential
+# axis: ``credential.interactive=false`` tells Git Credential Manager (and other
+# helpers that honor it) to fail rather than pop a GUI prompt. Paired with the
+# ``GIT_TERMINAL_PROMPT=0`` env below, a missing credential becomes a fast, clean
+# error on every platform instead of a hang.
+_NONINTERACTIVE_CONFIG = ("-c", "credential.interactive=false")
 
 
-def _network_env(token: Optional[str], *, https_only: bool = False) -> dict[str, str]:
-    """The environment for a network git call: token in, prompt off, no argv leak.
+def _noninteractive_config() -> list[str]:
+    """``-c`` flags enforcing the non-interactive credential posture."""
+    return list(_NONINTERACTIVE_CONFIG)
 
-    ``GIT_TERMINAL_PROMPT=0`` turns a missing credential from a hung TTY prompt
-    into a clean error. ``https_only`` adds ``GIT_ALLOW_PROTOCOL=https`` for the
-    one verb whose URL the container supplies.
+
+def _noninteractive_env(*, https_only: bool = False) -> dict[str, str]:
+    """The environment for a network git call: strictly non-interactive, no token.
+
+    ``GIT_TERMINAL_PROMPT=0`` stops git itself from prompting on a TTY, turning a
+    missing credential into a clean error. Host git supplies its own credential, so
+    nothing is injected here. ``https_only`` adds ``GIT_ALLOW_PROTOCOL=https`` for
+    the one verb whose URL the container supplies (a security allow-list, unrelated
+    to credentials).
     """
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    if token:
-        env[_GIT_TOKEN_ENV] = token
     if https_only:
         env["GIT_ALLOW_PROTOCOL"] = "https"
     return env
@@ -230,21 +251,15 @@ class GitRepo:
     def is_dirty(self) -> bool:
         return bool(self._git("status", "--porcelain"))
 
-    def fetch(
-        self,
-        remote: str,
-        refs: Optional[Iterable[str]] = None,
-        *,
-        token: Optional[str] = None,
-    ) -> None:
+    def fetch(self, remote: str, refs: Optional[Iterable[str]] = None) -> None:
         args = ["fetch", remote]
         if refs is not None:
             args.extend(refs)
         run_git(
             args,
             cwd=self.path,
-            env=_network_env(token),
-            config=_credential_config(token),
+            env=_noninteractive_env(),
+            config=_noninteractive_config(),
         )
 
     def checkout(self, ref: str) -> None:
@@ -272,18 +287,18 @@ def clone(
     *,
     profile: FsProfile,
     slug: str,
-    token: Optional[str] = None,
 ) -> GitRepo:
     """Clone ``url`` into ``dest``, stamping ``profile`` + ``slug`` before checkout.
 
     ``--no-checkout`` so the stamp governs the working-tree population (notably
-    symlink / filemode handling). Network call: runs under the credential helper.
+    symlink / filemode handling). Network call: runs under the non-interactive
+    posture, letting host git resolve credentials or fail fast.
     """
     dest = Path(dest)
     run_git(
         ["clone", "--no-checkout", str(url), str(dest)],
-        env=_network_env(token),
-        config=_credential_config(token),
+        env=_noninteractive_env(),
+        config=_noninteractive_config(),
     )
     repo = GitRepo(dest)
     repo._apply_profile(profile)
@@ -615,7 +630,6 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
     slug = _valid_slug(params.get("slug"))
     refs = list(params.get("refs") or [])
     initial_branch = params.get("initial_branch")
-    token = ctx.github_token
     profile = host_profile()
 
     if not _repo_def_path(ctx, slug).is_file():
@@ -644,10 +658,10 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
                 return _src("create-failed", f"init {slug!r} failed: {e}")
             return _src("initialized", f"initialized {slug!r}")
         try:
-            repo = clone(
-                source_url, ctx.offline_root / slug, profile=profile, slug=slug, token=token
-            )
+            repo = clone(source_url, ctx.offline_root / slug, profile=profile, slug=slug)
         except GitError as e:
+            if is_auth_failure(str(e)):
+                return _src("create-failed", _auth_summary(slug))
             return _src("create-failed", f"clone {slug!r} failed: {e}")
         return _verify_refs(repo, refs, "cloned", f"cloned {slug!r}", slug)
 
@@ -655,11 +669,13 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
     repo = GitRepo(observed.location)
     if source_url is not None:
         try:
-            repo.fetch("origin", token=token)
+            repo.fetch("origin")
         except GitError:
             try:
-                repo.fetch(source_url, token=token)
+                repo.fetch(source_url)
             except GitError as e:
+                if is_auth_failure(str(e)):
+                    return _src("fetch-failed", _auth_summary(slug))
                 return _src("fetch-failed", f"fetch {slug!r} failed: {e}")
     if source_url is None and not refs:
         return _src("ok", f"{slug!r} present, no source to fetch")
@@ -796,22 +812,25 @@ def _remote_default_branch(
     """Probe a remote's default branch (symbolic HEAD), or ``None``.
 
     The URL is container-supplied, so it is scheme-checked (https only) and git is
-    run under ``GIT_ALLOW_PROTOCOL=https``, with the token scoped to github.com by
-    the credential helper — no file/ssh/helper side channels.
+    run under ``GIT_ALLOW_PROTOCOL=https`` — no file/ssh/helper side channels. Host
+    git supplies any credential; on an auth failure the probe returns the actionable
+    host-setup hint.
     """
     ctx = _require_ctx(ctx)
     url = _sanitize_remote_url(params.get("url"))
     try:
-        branch = _ls_remote_symref_hardened(url, ctx.github_token)
+        branch = _ls_remote_symref_hardened(url)
     except GitError as e:
+        if is_auth_failure(str(e)):
+            raise VerbError(SERVER_ERROR, _auth_summary(url))
         raise VerbError(SERVER_ERROR, f"remote probe failed: {e}")
     return {"branch": branch}
 
 
-def _ls_remote_symref_hardened(url: str, token: Optional[str]) -> Optional[str]:
-    """``ls-remote --symref`` under the hardened, https-only network posture."""
+def _ls_remote_symref_hardened(url: str) -> Optional[str]:
+    """``ls-remote --symref`` under the hardened, non-interactive, https-only posture."""
     return ls_remote_symref(
         url,
-        env=_network_env(token, https_only=True),
-        config=_credential_config(token),
+        env=_noninteractive_env(https_only=True),
+        config=_noninteractive_config(),
     )

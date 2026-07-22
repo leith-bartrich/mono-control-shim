@@ -44,27 +44,11 @@ _HOST_PLATFORM_BY_SYSTEM = {
     "Linux": "linux",
 }
 
-# GitHub credential carried into the container (see mono-control's
-# docs/design/github-auth.md). Like the host platform, this is host-side knowledge the
-# container cannot obtain for itself — a credential lives in an OS keyring no Linux
-# container can reach — so the shim is again the component that must supply it.
-#
-# Unlike the host platform it is a SECRET, which changes how it is passed, not whether:
-# it is put in the environment handed to `docker` and named by a VALUELESS `-e`, so it
-# never appears in this process's argv (where any local process could read it off the
-# process table). It is never printed, and never given a value on a command line.
-GITHUB_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
-
-# Environment variables consulted for a token, in order, before falling back to `gh`.
-# The first is our own; the rest are the ecosystem's de-facto standards, honored so a
-# CI runner or an existing shell setup works without special-casing mono-control.
-_TOKEN_ENV_VARS = (GITHUB_TOKEN_ENV, "GH_TOKEN", "GITHUB_TOKEN")
-
 # Host-callback broker coordinates carried into the container (see broker.py). Same
-# shape as the two above — host-side knowledge the container cannot derive — split
-# by sensitivity: the host and port are not secret and ride the `-e KEY=VALUE` path,
-# while the per-run token is a SECRET and takes the same valueless-`-e` route as the
-# GitHub token, so it never appears in argv.
+# shape as the host platform above — host-side knowledge the container cannot derive —
+# split by sensitivity: the host and port are not secret and ride the `-e KEY=VALUE`
+# path, while the per-run token is a SECRET and takes a VALUELESS `-e` route (named in
+# argv, valued only in the environment handed to docker), so it never appears in argv.
 #
 # `host.docker.internal` is the name Docker Desktop gives the host from inside a
 # container. The shim names it rather than an address because the address is not
@@ -74,56 +58,6 @@ BROKER_PORT_ENV = "MONO_BROKER_PORT"
 BROKER_TOKEN_ENV = "MONO_BROKER_TOKEN"
 
 BROKER_CONTAINER_HOST = "host.docker.internal"
-
-_GH_FALLBACK_WARNING = (
-    f"warning: no {GITHUB_TOKEN_ENV} set; falling back to your `gh` OAuth token.\n"
-    "  That token typically carries repo + workflow + gist WRITE access to every repo\n"
-    "  you own, but mono-control only ever reads (clone / ls-remote / checkout).\n"
-    f"  Prefer a fine-grained PAT with read-only Contents, exported as {GITHUB_TOKEN_ENV}."
-)
-
-
-def _resolve_github_token() -> str | None:
-    """Return a GitHub token for the container, or ``None`` if none is available.
-
-    Precedence mirrors ``_detect_host_platform``: an explicit environment value wins,
-    otherwise we go and find one. Here "find one" means asking `gh` for the token it
-    already holds in the host keyring.
-
-    Returning ``None`` is a normal outcome, NOT an error — public remotes need no
-    credential and most of mono-control needs no network at all. A private remote with
-    no token fails inside the container, where the failure is specific and can say so;
-    guessing here that the user will need one would break every offline invocation.
-
-    The token is never logged. The `gh` fallback prints a warning naming the write
-    scopes it drags along, so the convenient path is never also the silent one.
-    """
-    for name in _TOKEN_ENV_VARS:
-        token = os.environ.get(name)
-        if token:
-            return token
-
-    gh = shutil.which("gh")
-    if gh is None:
-        return None
-    try:
-        result = subprocess.run(
-            [gh, "auth", "token"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None  # gh present but not logged in.
-
-    token = result.stdout.strip()
-    if not token:
-        return None
-    print(_GH_FALLBACK_WARNING, file=sys.stderr)
-    return token
 
 
 def _detect_host_platform() -> str:
@@ -340,14 +274,11 @@ def _dispatch(
         return 1
     env = {**(env or {}), HOST_PLATFORM_ENV: host_platform}
 
-    # The shim is likewise the host-side authority for the GitHub credential, for the
-    # same reason: the container cannot reach the host keyring. It is no longer handed
-    # to the container at all — the broker now performs every git effect on the host and
-    # holds this token itself (see the HostContext below). We still resolve it here (and
-    # warn on the `gh` fallback) precisely to feed that HostContext. No token is a normal
-    # state, not an error.
+    # No GitHub credential is resolved or carried anymore. The broker performs every
+    # git effect on the host, as the developer, so host git resolves credentials from
+    # the host's own machinery (gh helper, Git Credential Manager, OS keyring,
+    # ~/.gitconfig). The container is handed nothing.
     secrets: dict[str, str] = {}
-    token = _resolve_github_token()
 
     # Stand up the host-callback broker for the lifetime of the container run, so the
     # container can ask the host to do the few things only the host can (see broker.py).
@@ -355,17 +286,16 @@ def _dispatch(
     # broken one. Warn and run without it.
     #
     # Importing the verb packs is what registers their handlers (@verb runs at import);
-    # the host context carries the host paths + token those handlers act on — knowledge
-    # the container cannot have and must not be handed. The paths are the managed
-    # workspace dirs (INIT_DIRS): mono-repos is the materialized root, mono-repos-offline
-    # the offline holding area, mono-config the manifest dir.
+    # the host context carries the host paths those handlers act on — knowledge the
+    # container cannot have and must not be handed. The paths are the managed workspace
+    # dirs (INIT_DIRS): mono-repos is the materialized root, mono-repos-offline the
+    # offline holding area, mono-config the manifest dir.
     from mono_control_shim import verbs  # noqa: F401  (import = register packs)
 
     host_context = HostContext(
         workspace_root=workspace / "mono-repos",
         offline_root=workspace / "mono-repos-offline",
         config_dir=workspace / "mono-config",
-        github_token=token,
     )
 
     broker: BrokerServer | None = None
