@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mono_control_shim.broker import BrokerServer
+from mono_control_shim.broker import BrokerServer, HostContext
 
 # A directory is recognized as a mono workspace when it contains the manifest
 # directory `mono-config/`. A `mono-control/` checkout may or may not sit beside
@@ -44,27 +44,11 @@ _HOST_PLATFORM_BY_SYSTEM = {
     "Linux": "linux",
 }
 
-# GitHub credential carried into the container (see mono-control's
-# docs/design/github-auth.md). Like the host platform, this is host-side knowledge the
-# container cannot obtain for itself — a credential lives in an OS keyring no Linux
-# container can reach — so the shim is again the component that must supply it.
-#
-# Unlike the host platform it is a SECRET, which changes how it is passed, not whether:
-# it is put in the environment handed to `docker` and named by a VALUELESS `-e`, so it
-# never appears in this process's argv (where any local process could read it off the
-# process table). It is never printed, and never given a value on a command line.
-GITHUB_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
-
-# Environment variables consulted for a token, in order, before falling back to `gh`.
-# The first is our own; the rest are the ecosystem's de-facto standards, honored so a
-# CI runner or an existing shell setup works without special-casing mono-control.
-_TOKEN_ENV_VARS = (GITHUB_TOKEN_ENV, "GH_TOKEN", "GITHUB_TOKEN")
-
 # Host-callback broker coordinates carried into the container (see broker.py). Same
-# shape as the two above — host-side knowledge the container cannot derive — split
-# by sensitivity: the host and port are not secret and ride the `-e KEY=VALUE` path,
-# while the per-run token is a SECRET and takes the same valueless-`-e` route as the
-# GitHub token, so it never appears in argv.
+# shape as the host platform above — host-side knowledge the container cannot derive —
+# split by sensitivity: the host and port are not secret and ride the `-e KEY=VALUE`
+# path, while the per-run token is a SECRET and takes a VALUELESS `-e` route (named in
+# argv, valued only in the environment handed to docker), so it never appears in argv.
 #
 # `host.docker.internal` is the name Docker Desktop gives the host from inside a
 # container. The shim names it rather than an address because the address is not
@@ -74,56 +58,6 @@ BROKER_PORT_ENV = "MONO_BROKER_PORT"
 BROKER_TOKEN_ENV = "MONO_BROKER_TOKEN"
 
 BROKER_CONTAINER_HOST = "host.docker.internal"
-
-_GH_FALLBACK_WARNING = (
-    f"warning: no {GITHUB_TOKEN_ENV} set; falling back to your `gh` OAuth token.\n"
-    "  That token typically carries repo + workflow + gist WRITE access to every repo\n"
-    "  you own, but mono-control only ever reads (clone / ls-remote / checkout).\n"
-    f"  Prefer a fine-grained PAT with read-only Contents, exported as {GITHUB_TOKEN_ENV}."
-)
-
-
-def _resolve_github_token() -> str | None:
-    """Return a GitHub token for the container, or ``None`` if none is available.
-
-    Precedence mirrors ``_detect_host_platform``: an explicit environment value wins,
-    otherwise we go and find one. Here "find one" means asking `gh` for the token it
-    already holds in the host keyring.
-
-    Returning ``None`` is a normal outcome, NOT an error — public remotes need no
-    credential and most of mono-control needs no network at all. A private remote with
-    no token fails inside the container, where the failure is specific and can say so;
-    guessing here that the user will need one would break every offline invocation.
-
-    The token is never logged. The `gh` fallback prints a warning naming the write
-    scopes it drags along, so the convenient path is never also the silent one.
-    """
-    for name in _TOKEN_ENV_VARS:
-        token = os.environ.get(name)
-        if token:
-            return token
-
-    gh = shutil.which("gh")
-    if gh is None:
-        return None
-    try:
-        result = subprocess.run(
-            [gh, "auth", "token"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None  # gh present but not logged in.
-
-    token = result.stdout.strip()
-    if not token:
-        return None
-    print(_GH_FALLBACK_WARNING, file=sys.stderr)
-    return token
 
 
 def _detect_host_platform() -> str:
@@ -241,11 +175,11 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
     return True, "docker daemon reachable and .devcontainer config present"
 
 
-# Directories that `mproj init` ensures exist in the workspace root. These are
-# the bind-mount sources the mono-control container expects to find. They MUST be
-# host-side dirs (not container-local): mono-repos-offline in particular is the
-# non-destructive retire holding area, so leaving it unmounted would lose unpushed
-# work — and under `docker compose run --rm` it would vanish after every call.
+# Directories that `mproj init` ensures exist in the workspace root. The broker acts
+# on these host-side dirs directly (they feed the HostContext), so they are no longer
+# bind-mounted into the container, but they MUST still exist on the host: mono-repos is
+# the materialized root, mono-repos-offline the non-destructive retire holding area
+# (whose unpushed work would be lost if it were absent), and mono-config the manifest dir.
 INIT_DIRS = ("mono-repos", "mono-repos-offline", "mono-config")
 
 
@@ -285,19 +219,19 @@ def _run_init(workspace: Path) -> int:
     return 0
 
 
-def _volume_args(workspace: Path) -> list[str]:
-    """Per-call bind mounts for the managed workspace dirs.
+def _warn_if_workspace_incomplete(workspace: Path) -> None:
+    """Warn (and suggest `mproj init`) for any missing managed workspace dir.
 
-    The container-side targets are fixed (they match src/mono_control/paths.py in
-    mono-control); only the host sources vary per invocation.
+    The broker now performs git/FS effects on these host paths directly (they feed
+    the ``HostContext``), so they are no longer bind-mounted into the container.
+    But they must still EXIST on the host for the broker to work, so the
+    missing-dir hint that used to ride along with the (now removed) bind mounts is
+    preserved here as a pure existence check that mounts nothing.
     """
-    args: list[str] = []
     for name in INIT_DIRS:  # mono-repos, mono-repos-offline, mono-config
         source = workspace / name
         if not source.is_dir():
             print(f"warning: {source} does not exist; run `mproj init`.", file=sys.stderr)
-        args += ["-v", f"{source}:/workspaces/{name}"]
-    return args
 
 
 # Persistent uv cache volume so repeated `--rm` runs (e.g. test-control) don't
@@ -316,6 +250,7 @@ def _dispatch(
     dev_only: bool = False,
     artifact: bool = False,
     env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Run *inner_argv* inside the mono-control container.
 
@@ -339,23 +274,33 @@ def _dispatch(
         return 1
     env = {**(env or {}), HOST_PLATFORM_ENV: host_platform}
 
-    # The shim is likewise the host-side authority for the GitHub credential, for the
-    # same reason: the container cannot reach the host keyring. But a token is a
-    # SECRET, so it does NOT join `env` above — that dict becomes `-e KEY=VALUE` on the
-    # command line, and argv is world-readable. Secrets are passed by name only; see
-    # `_secret_args` / `_secret_environ`. No token is a normal state, not an error.
+    # No GitHub credential is resolved or carried anymore. The broker performs every
+    # git effect on the host, as the developer, so host git resolves credentials from
+    # the host's own machinery (gh helper, Git Credential Manager, OS keyring,
+    # ~/.gitconfig). The container is handed nothing.
     secrets: dict[str, str] = {}
-    token = _resolve_github_token()
-    if token:
-        secrets[GITHUB_TOKEN_ENV] = token
 
     # Stand up the host-callback broker for the lifetime of the container run, so the
     # container can ask the host to do the few things only the host can (see broker.py).
-    # It is BEST-EFFORT in Step 1: nothing depends on it yet, so a failure to bind must
-    # not turn a working command into a broken one. Warn and run without it.
+    # It is BEST-EFFORT: a failure to bind must not turn a working command into a
+    # broken one. Warn and run without it.
+    #
+    # Importing the verb packs is what registers their handlers (@verb runs at import);
+    # the host context carries the host paths those handlers act on — knowledge the
+    # container cannot have and must not be handed. The paths are the managed workspace
+    # dirs (INIT_DIRS): mono-repos is the materialized root, mono-repos-offline the
+    # offline holding area, mono-config the manifest dir.
+    from mono_control_shim import verbs  # noqa: F401  (import = register packs)
+
+    host_context = HostContext(
+        workspace_root=workspace / "mono-repos",
+        offline_root=workspace / "mono-repos-offline",
+        config_dir=workspace / "mono-config",
+    )
+
     broker: BrokerServer | None = None
     try:
-        broker = BrokerServer()
+        broker = BrokerServer(host_context)
         broker.start()
     except OSError as e:
         print(
@@ -377,7 +322,8 @@ def _dispatch(
     try:
         if (workspace / "mono-control").is_dir() and not artifact:
             return _dev_run(
-                docker, workspace, inner_argv, build=build, env=env, secrets=secrets
+                docker, workspace, inner_argv, build=build, env=env, secrets=secrets,
+                stdout_path=stdout_path,
             )
         if dev_only:
             print(
@@ -390,7 +336,10 @@ def _dispatch(
                 "warning: --build has no effect in artifact mode (no mono-control source).",
                 file=sys.stderr,
             )
-        return _artifact_run(docker, workspace, inner_argv, env=env, secrets=secrets)
+        return _artifact_run(
+            docker, workspace, inner_argv, env=env, secrets=secrets,
+            stdout_path=stdout_path,
+        )
     finally:
         # The broker's authority is scoped to exactly one container run. Ending it here
         # means the token dies with the command that issued it.
@@ -430,6 +379,7 @@ def _dev_run(
     build: bool = False,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Dev mode: run *inner_argv* via the checked-out mono-control's Compose.
 
@@ -452,12 +402,17 @@ def _dev_run(
         cmd += ["-e", f"{key}={value}"]
     cmd += _secret_args(secrets)
     # Mount live source over the baked copy so working-tree edits are reflected,
-    # plus a persistent uv cache so repeated runs don't re-download deps.
+    # plus a persistent uv cache so repeated runs don't re-download deps. The managed
+    # workspace dirs (mono-repos / -offline / mono-config) are NOT mounted: the broker
+    # touches them on the host. Still warn if they are missing — the broker needs them.
     cmd += ["-v", f"{workspace / 'mono-control'}:/workspaces/mono-control"]
     cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
-    cmd += _volume_args(workspace)
+    _warn_if_workspace_incomplete(workspace)
     cmd += ["mono-control", *inner_argv]  # compose service name, then the command
-    return _exec(cmd, env=_secret_environ(secrets))
+    # Only thread stdout_path when capturing (json-schema-control), so the ordinary
+    # streaming call shape is byte-for-byte unchanged.
+    extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
+    return _exec(cmd, env=_secret_environ(secrets), **extra)
 
 
 def _artifact_run(
@@ -467,6 +422,7 @@ def _artifact_run(
     *,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
 ) -> int:
     """Artifact mode: run *inner_argv* in the prebuilt image (no source on disk)."""
     # No source to build from here, so detect a missing image and tell the user
@@ -500,11 +456,16 @@ def _artifact_run(
     for key, value in (env or {}).items():
         cmd += ["-e", f"{key}={value}"]
     cmd += _secret_args(secrets)
-    if sys.stdin.isatty() and sys.stdout.isatty():
+    if stdout_path is None and sys.stdin.isatty() and sys.stdout.isatty():
+        # No pseudo-TTY when capturing stdout to a file: `-t` would inject terminal
+        # control bytes and corrupt the JSON we are trying to save.
         cmd.append("-it")  # interactive (e.g. mono-control repl / shell-control)
-    cmd += _volume_args(workspace)
+    # The managed workspace dirs are not mounted (the broker touches them on the host);
+    # still warn if any is missing, since the broker needs them present.
+    _warn_if_workspace_incomplete(workspace)
     cmd += [MONO_CONTROL_IMAGE, *inner_argv]
-    return _exec(cmd, env=_secret_environ(secrets))
+    extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
+    return _exec(cmd, env=_secret_environ(secrets), **extra)
 
 
 def _run_control(
@@ -538,13 +499,49 @@ def _run_test_control(workspace: Path, command_args: list[str]) -> int:
     )
 
 
-def _exec(cmd: list[str], *, env: dict[str, str] | None = None) -> int:
+# Where `json-schema-control` writes the emitted wire contract. Inside this
+# package's tree so the generated file is checked in and diffable — the host side
+# implements to this schema, so a drift shows up in review.
+SCHEMA_PATH = Path(__file__).resolve().parent / "schema" / "wire-schema.json"
+
+
+def _run_json_schema_control(workspace: Path) -> int:
+    """`mproj json-schema-control` — refresh this repo's checked-in wire schema.
+
+    Runs the container's ``mono-control emit-schema`` and captures its stdout (the
+    JSON Schema of the broker's 20 wire models) into ``SCHEMA_PATH``. Sibling of
+    ``test-control``; like it, it needs the container (dev mode via Compose, or the
+    prebuilt artifact image). The broker's own diagnostics stay on stderr, so only
+    the schema JSON lands in the file.
+    """
+    rc = _dispatch(
+        workspace, ["mono-control", "emit-schema"], stdout_path=SCHEMA_PATH
+    )
+    if rc == 0:
+        print(f"wrote: {SCHEMA_PATH}", file=sys.stderr)
+    return rc
+
+
+def _exec(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    stdout_path: Path | None = None,
+) -> int:
     """Run *cmd*, inheriting stdio, and return its exit code as ours.
 
     ``env`` replaces the child's environment wholesale; ``None`` inherits ours. It is
     how secrets reach docker without passing through argv (see ``_secret_environ``).
+
+    ``stdout_path`` redirects the child's stdout to that file (stderr still streams
+    to ours) — how ``json-schema-control`` captures ``emit-schema``'s JSON into the
+    repo while the broker's diagnostics stay on the terminal.
     """
     try:
+        if stdout_path is not None:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(stdout_path, "w", encoding="utf-8", newline="\n") as out:
+                return subprocess.run(cmd, check=False, env=env, stdout=out).returncode
         return subprocess.run(cmd, check=False, env=env).returncode
     except (OSError, subprocess.SubprocessError) as e:
         print(f"error: failed to launch container: {e}", file=sys.stderr)
@@ -660,6 +657,13 @@ def main(argv: list[str] | None = None) -> int:
         "(e.g. `mproj test-control -- -k foo -q`).",
     )
 
+    schema_parser = subparsers.add_parser(
+        "json-schema-control",
+        help="Emit mono-control's broker wire-contract JSON Schema into this "
+        f"repo ({SCHEMA_PATH.name}), for a checked-in, diffable contract.",
+    )
+    _add_workspace_arg(schema_parser)
+
     args = parser.parse_args(argv)
 
     # `init` bootstraps the workspace, so it resolves its target without
@@ -691,6 +695,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "test-control":
         return _run_test_control(workspace, args.command_args)
+
+    if args.command == "json-schema-control":
+        return _run_json_schema_control(workspace)
 
     return _run_status(workspace)
 

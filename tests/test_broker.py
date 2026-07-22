@@ -78,10 +78,15 @@ class Verbs(BrokerTestCase):
     def test_broker_info_advertises_version_and_verbs(self) -> None:
         _, payload = self._call("broker.info")
 
+        methods = payload["result"]["methods"]
         self.assertEqual(payload["result"]["version"], broker.BROKER_VERSION)
-        # The exact set, not a subset: a verb appearing here unnoticed is precisely
-        # the regression this repo cannot afford.
-        self.assertEqual(payload["result"]["methods"], ["broker.info", "ping"])
+        # Advertised sorted, and the Step 1 transport core is always present. The
+        # exact set now depends on which verb packs have been imported (Step 2 adds
+        # git + mono_config); test_verbs guards that full set, so here we assert the
+        # invariant that survives pack registration: sorted, with the core verbs.
+        self.assertEqual(methods, sorted(methods))
+        self.assertIn("ping", methods)
+        self.assertIn("broker.info", methods)
 
 
 class Authentication(BrokerTestCase):
@@ -199,7 +204,7 @@ class InternalError(BrokerTestCase):
         super().setUp()
 
         @broker.verb("test.boom")
-        def _boom(params):  # noqa: ANN001, ANN202
+        def _boom(params, ctx):  # noqa: ANN001, ANN202
             raise RuntimeError("secret host detail: C:/Users/someone/.ssh/id_ed25519")
 
         self.addCleanup(broker._VERBS.pop, "test.boom", None)

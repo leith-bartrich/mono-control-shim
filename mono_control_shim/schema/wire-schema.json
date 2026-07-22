@@ -1,0 +1,523 @@
+{
+  "AcquireRequest": {
+    "additionalProperties": false,
+    "description": "Ask the broker to make ``refs`` locally resolvable for ``slug``.\n\nThe broker resolves the source URL from mono-config (never trusted from the\ncontainer), clones / inits / fetches as needed, verifies each requested ref,\nand returns a ``SourceOutcome``-shaped result. ``initial_branch`` names the\nbranch a brand-new (source-less) repo is initialized on.",
+    "properties": {
+      "initial_branch": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Initial Branch"
+      },
+      "refs": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "title": "Refs",
+        "type": "array"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug"
+    ],
+    "title": "AcquireRequest",
+    "type": "object"
+  },
+  "AcquireResult": {
+    "additionalProperties": false,
+    "description": "A ``SourceOutcome`` in JSON-native form (plus the ref\u2192commit ``resolved`` map).\n\n``resolved`` gives ``plan()`` the concrete commit for a requested ref (e.g. a\n``PresentBranchHead`` target's ``refs/heads/<branch>``) as plain data, so the\nplan stage needs no git read of its own.",
+    "properties": {
+      "resolved": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "default": {},
+        "title": "Resolved",
+        "type": "object"
+      },
+      "status": {
+        "title": "Status",
+        "type": "string"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      },
+      "unresolved_refs": {
+        "default": [],
+        "items": {
+          "type": "string"
+        },
+        "title": "Unresolved Refs",
+        "type": "array"
+      }
+    },
+    "required": [
+      "status",
+      "summary"
+    ],
+    "title": "AcquireResult",
+    "type": "object"
+  },
+  "CheckoutRequest": {
+    "additionalProperties": false,
+    "description": "Check ``commit`` out at ``slug``'s current location (hex commit only).",
+    "properties": {
+      "commit": {
+        "title": "Commit",
+        "type": "string"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug",
+      "commit"
+    ],
+    "title": "CheckoutRequest",
+    "type": "object"
+  },
+  "LayoutOpRequest": {
+    "additionalProperties": false,
+    "description": "Place / relocate / retire ``slug``. ``location`` is a path relative to the\nworkspace root (``None`` for retire, whose destination the broker derives from\nthe slug). The broker normalizes it *inside* the workspace root and re-runs the\nrace guards (slug re-verify, occupancy).",
+    "properties": {
+      "location": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Location"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug"
+    ],
+    "title": "LayoutOpRequest",
+    "type": "object"
+  },
+  "LayoutOpResult": {
+    "additionalProperties": false,
+    "description": "A ``LayoutOutcome`` in JSON-native form (shared by every layout verb).",
+    "properties": {
+      "status": {
+        "title": "Status",
+        "type": "string"
+      },
+      "summary": {
+        "title": "Summary",
+        "type": "string"
+      }
+    },
+    "required": [
+      "status",
+      "summary"
+    ],
+    "title": "LayoutOpResult",
+    "type": "object"
+  },
+  "OkResult": {
+    "additionalProperties": false,
+    "description": "A minimal acknowledgement for write verbs.",
+    "properties": {
+      "ok": {
+        "default": true,
+        "title": "Ok",
+        "type": "boolean"
+      }
+    },
+    "title": "OkResult",
+    "type": "object"
+  },
+  "ReadLayoutRequest": {
+    "additionalProperties": false,
+    "description": "Read ``<cluster_slug>``'s ``product-cluster/default-layout.json``.\n\nThe document lives inside the (broker-side) managed checkout; the container\nchecks presence/materialization from a prior ``scan`` and asks only for the\nfile's contents here.",
+    "properties": {
+      "cluster_slug": {
+        "title": "Cluster Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "cluster_slug"
+    ],
+    "title": "ReadLayoutRequest",
+    "type": "object"
+  },
+  "ReadLayoutResult": {
+    "additionalProperties": false,
+    "description": "The layout file's contents, or ``exists=False`` if it isn't authored yet.",
+    "properties": {
+      "exists": {
+        "title": "Exists",
+        "type": "boolean"
+      },
+      "layout": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Layout"
+      }
+    },
+    "required": [
+      "exists"
+    ],
+    "title": "ReadLayoutResult",
+    "type": "object"
+  },
+  "RemoteDefaultBranchRequest": {
+    "additionalProperties": false,
+    "description": "Ask the broker for the default branch (symbolic ``HEAD``) of a remote.\n\nTakes a raw ``url`` \u2014 not a slug \u2014 because guided repo-add probes a remote the\nuser is *defining*, so the repo def may not exist in mono-config yet. This is\nthe same trust boundary the ``save_repo_def`` write verbs already use: the\ncontainer authors remote URLs, so letting it probe one is consistent.\n\nSHIM SECURITY (when the real handler is implemented, other repo): the URL is\nattacker-influenced, so the broker MUST sanitize it, run ``git ls-remote\n--symref <url> HEAD`` under ``GIT_ALLOW_PROTOCOL=https`` (no ``file://`` /\n``ext://`` / ssh side channels), and rely on the github.com-only credential\nhelper to scope the token to intended hosts. Never interpolate the URL into a\nshell.",
+    "properties": {
+      "url": {
+        "title": "Url",
+        "type": "string"
+      }
+    },
+    "required": [
+      "url"
+    ],
+    "title": "RemoteDefaultBranchRequest",
+    "type": "object"
+  },
+  "RemoteDefaultBranchResult": {
+    "additionalProperties": false,
+    "description": "The remote's default branch (e.g. ``main``), or ``None`` if it has none.",
+    "properties": {
+      "branch": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Branch"
+      }
+    },
+    "title": "RemoteDefaultBranchResult",
+    "type": "object"
+  },
+  "RepoDefsRequest": {
+    "additionalProperties": false,
+    "description": "Read repo definition JSON. ``slugs=None`` returns every definition.",
+    "properties": {
+      "slugs": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slugs"
+      }
+    },
+    "title": "RepoDefsRequest",
+    "type": "object"
+  },
+  "RepoDefsResult": {
+    "additionalProperties": false,
+    "description": "Raw ``<slug>.json`` repo definitions keyed by slug.\n\nThe container-side ``RepoStore`` keeps ownership of pydantic validation,\nlist filtering, and the retire/restore mutations; this verb only serves the\nraw JSON that a workspace mount used to provide.",
+    "properties": {
+      "repos": {
+        "additionalProperties": true,
+        "default": {},
+        "title": "Repos",
+        "type": "object"
+      }
+    },
+    "title": "RepoDefsResult",
+    "type": "object"
+  },
+  "SaveRepoDefRequest": {
+    "additionalProperties": false,
+    "description": "Create or overwrite one repo definition (``repo`` is the raw ``<slug>.json``).",
+    "properties": {
+      "repo": {
+        "additionalProperties": true,
+        "title": "Repo",
+        "type": "object"
+      }
+    },
+    "required": [
+      "repo"
+    ],
+    "title": "SaveRepoDefRequest",
+    "type": "object"
+  },
+  "SaveSystemRequest": {
+    "additionalProperties": false,
+    "description": "Create or overwrite ``system.json`` (``system`` is its raw contents).",
+    "properties": {
+      "system": {
+        "additionalProperties": true,
+        "title": "System",
+        "type": "object"
+      }
+    },
+    "required": [
+      "system"
+    ],
+    "title": "SaveSystemRequest",
+    "type": "object"
+  },
+  "SlugRequest": {
+    "additionalProperties": false,
+    "description": "A verb keyed only by ``slug`` (e.g. purge a repo definition).",
+    "properties": {
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug"
+    ],
+    "title": "SlugRequest",
+    "type": "object"
+  },
+  "SystemResult": {
+    "additionalProperties": false,
+    "description": "The raw ``system.json`` contents, or ``None`` when it does not exist.",
+    "properties": {
+      "system": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "System"
+      }
+    },
+    "title": "SystemResult",
+    "type": "object"
+  },
+  "WireInventory": {
+    "$defs": {
+      "WireRepo": {
+        "additionalProperties": false,
+        "description": "One observed checkout in JSON-native form (relative location + state).",
+        "properties": {
+          "commit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit"
+          },
+          "dirty": {
+            "title": "Dirty",
+            "type": "boolean"
+          },
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "offline",
+              "materialized"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "location",
+          "state",
+          "commit",
+          "dirty"
+        ],
+        "title": "WireRepo",
+        "type": "object"
+      },
+      "WireUnmanaged": {
+        "additionalProperties": false,
+        "description": "An unmanaged (unstamped) checkout found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to \u2014 so a foreign tree found under\nthe offline root round-trips back to the offline root, not the workspace one.",
+        "properties": {
+          "location": {
+            "title": "Location",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "offline",
+              "materialized"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "location",
+          "state"
+        ],
+        "title": "WireUnmanaged",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "description": "The on-disk observation in JSON-native form: managed repos + unmanaged.",
+    "properties": {
+      "repos": {
+        "default": [],
+        "items": {
+          "$ref": "#/$defs/WireRepo"
+        },
+        "title": "Repos",
+        "type": "array"
+      },
+      "unmanaged": {
+        "default": [],
+        "items": {
+          "$ref": "#/$defs/WireUnmanaged"
+        },
+        "title": "Unmanaged",
+        "type": "array"
+      }
+    },
+    "title": "WireInventory",
+    "type": "object"
+  },
+  "WireRepo": {
+    "additionalProperties": false,
+    "description": "One observed checkout in JSON-native form (relative location + state).",
+    "properties": {
+      "commit": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "title": "Commit"
+      },
+      "dirty": {
+        "title": "Dirty",
+        "type": "boolean"
+      },
+      "location": {
+        "title": "Location",
+        "type": "string"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      },
+      "state": {
+        "enum": [
+          "offline",
+          "materialized"
+        ],
+        "title": "State",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug",
+      "location",
+      "state",
+      "commit",
+      "dirty"
+    ],
+    "title": "WireRepo",
+    "type": "object"
+  },
+  "WireUnmanaged": {
+    "additionalProperties": false,
+    "description": "An unmanaged (unstamped) checkout found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to \u2014 so a foreign tree found under\nthe offline root round-trips back to the offline root, not the workspace one.",
+    "properties": {
+      "location": {
+        "title": "Location",
+        "type": "string"
+      },
+      "state": {
+        "enum": [
+          "offline",
+          "materialized"
+        ],
+        "title": "State",
+        "type": "string"
+      }
+    },
+    "required": [
+      "location",
+      "state"
+    ],
+    "title": "WireUnmanaged",
+    "type": "object"
+  },
+  "WriteLayoutRequest": {
+    "additionalProperties": false,
+    "description": "Author ``<cluster_slug>``'s layout document with ``layout`` (a JSON dict).\n\nNot in the original Step-2 verb table (which listed only ``read_layout``); a\nwrite path is required because the ``layout add`` / ``remove`` / ``manage``\nauthoring commands mutate the file, which is now a broker-side FS effect.",
+    "properties": {
+      "cluster_slug": {
+        "title": "Cluster Slug",
+        "type": "string"
+      },
+      "layout": {
+        "additionalProperties": true,
+        "title": "Layout",
+        "type": "object"
+      }
+    },
+    "required": [
+      "cluster_slug",
+      "layout"
+    ],
+    "title": "WriteLayoutRequest",
+    "type": "object"
+  }
+}
