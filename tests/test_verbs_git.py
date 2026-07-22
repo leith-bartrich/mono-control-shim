@@ -94,7 +94,6 @@ class GitVerbsCase(unittest.TestCase):
             workspace_root=self.workspace,
             offline_root=self.offline,
             config_dir=self.config,
-            github_token=None,
         )
 
     # -- fixtures ---------------------------------------------------------- #
@@ -327,30 +326,144 @@ class ContextRequired(GitVerbsCase):
         self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
 
 
-class CredentialHardening(unittest.TestCase):
-    """The token reaches git via env + a github-scoped helper, never on argv."""
+class NonInteractivePosture(GitVerbsCase):
+    """Network git runs strictly non-interactively and injects NO credential.
 
-    def test_credential_config_scopes_helper_to_github_and_omits_token(self) -> None:
-        config = git._credential_config("s3cr3t-token")
-        joined = " ".join(config)
-        self.assertIn("credential.https://github.com.helper", joined)
-        self.assertNotIn("s3cr3t-token", joined)  # THE assertion: no token in argv
-        # References the env var by name so git's own shell expands it at call time.
-        self.assertIn(git._GIT_TOKEN_ENV, joined)
+    Host git resolves credentials from the host's own machinery; the broker's only
+    job on the credential axis is to make sure a git op that could touch credentials
+    fails fast (never hangs on a prompt / GUI popup) and hands git no token or helper.
+    """
 
-    def test_no_token_registers_no_helper(self) -> None:
-        self.assertEqual(git._credential_config(None), [])
-        self.assertEqual(git._credential_config(""), [])
-
-    def test_network_env_hardens_and_carries_token_in_env_only(self) -> None:
-        env = git._network_env("tok", https_only=True)
+    def test_noninteractive_env_turns_off_the_terminal_prompt(self) -> None:
+        env = git._noninteractive_env()
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(env["GIT_ALLOW_PROTOCOL"], "https")
-        self.assertEqual(env[git._GIT_TOKEN_ENV], "tok")
-
-    def test_network_env_without_https_only_leaves_protocol_unrestricted(self) -> None:
-        env = git._network_env("tok")
+        # No token / credential env is injected — host git supplies its own.
+        self.assertNotIn("MONO_CONTROL_GITHUB_TOKEN", env)
+        # Plain (non-https-only) network ops leave the protocol allow-list alone.
         self.assertNotIn("GIT_ALLOW_PROTOCOL", env)
+
+    def test_https_only_adds_the_protocol_allowlist(self) -> None:
+        env = git._noninteractive_env(https_only=True)
+        self.assertEqual(env["GIT_ALLOW_PROTOCOL"], "https")
+
+    def test_noninteractive_config_suppresses_credential_gui_and_injects_no_helper(self) -> None:
+        config = git._noninteractive_config()
+        joined = " ".join(config)
+        self.assertIn("credential.interactive=false", joined)
+        # No credential helper and no token are ever put on git's command line.
+        self.assertNotIn("helper", joined)
+        self.assertNotIn("MONO_CONTROL_GITHUB_TOKEN", joined)
+
+    def test_network_git_calls_carry_the_posture_and_no_token(self) -> None:
+        # Spy on what the network subcommands (clone / fetch) hand run_git during a
+        # real, hermetic acquire against a local bare repo.
+        bare, _ = self._make_origin()
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        seen: list[tuple[str, dict, list]] = []
+        real_run_git = git.run_git
+
+        def spy(args, **kwargs):  # noqa: ANN001, ANN003
+            if args and args[0] in ("clone", "fetch", "ls-remote"):
+                seen.append((args[0], kwargs.get("env") or {}, kwargs.get("config") or []))
+            return real_run_git(args, **kwargs)
+
+        with mock.patch.object(git, "run_git", spy):
+            git._acquire({"slug": "proj", "refs": []}, self.ctx)  # clone
+            git._acquire({"slug": "proj", "refs": ["refs/heads/main"]}, self.ctx)  # fetch
+
+        self.assertTrue(seen, "expected at least one network git subcommand")
+        self.assertEqual({name for name, _, _ in seen}, {"clone", "fetch"})
+        for name, env, config in seen:
+            self.assertEqual(env.get("GIT_TERMINAL_PROMPT"), "0", name)
+            joined = " ".join(config)
+            self.assertIn("credential.interactive=false", joined)
+            self.assertNotIn("helper", joined)  # no injected credential helper
+            self.assertNotIn("MONO_CONTROL_GITHUB_TOKEN", env)  # no injected token
+
+
+class AuthFailureSummary(GitVerbsCase):
+    """An auth-style git failure yields the actionable 'set up gh/credentials' summary.
+
+    Hermetic: the failure is simulated by monkeypatching ``run_git`` to raise a
+    ``GitError`` whose message carries an auth marker — no network is touched.
+    """
+
+    _AUTH_STDERR = (
+        "`git clone https://github.com/o/r.git` failed: "
+        "fatal: Authentication failed for 'https://github.com/o/r.git'"
+    )
+
+    def test_is_auth_failure_matches_auth_markers_only(self) -> None:
+        self.assertTrue(git.is_auth_failure("fatal: Authentication failed for 'x'"))
+        self.assertTrue(git.is_auth_failure(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ))
+        # A non-auth network error is not misclassified.
+        self.assertFalse(git.is_auth_failure("fatal: unable to access 'x': Could not resolve host"))
+
+    def _assert_actionable(self, summary: str) -> None:
+        low = summary.lower()
+        self.assertIn("authentication failed", low)
+        self.assertIn("gh auth login", low)
+        self.assertIn("github.com", low)
+
+    def test_clone_auth_failure_returns_the_setup_hint(self) -> None:
+        self._write_repo_def("proj", sources={"origin": "https://github.com/o/r.git"})
+
+        def boom(args, **kwargs):  # noqa: ANN001, ANN003
+            raise git.GitError(self._AUTH_STDERR)
+
+        with mock.patch.object(git, "run_git", boom):
+            out = git._acquire({"slug": "proj", "refs": []}, self.ctx)
+
+        self.assertEqual(out["status"], "create-failed")
+        self._assert_actionable(out["summary"])
+
+    def test_fetch_auth_failure_returns_the_setup_hint(self) -> None:
+        # A real offline checkout first, then auth failure on the fetch only.
+        self._acquire_offline("proj")
+        real_run_git = git.run_git
+
+        def spy(args, **kwargs):  # noqa: ANN001, ANN003
+            if args and args[0] == "fetch":
+                raise git.GitError(
+                    "`git fetch origin` failed: remote: Invalid username or password."
+                )
+            return real_run_git(args, **kwargs)
+
+        with mock.patch.object(git, "run_git", spy):
+            out = git._acquire({"slug": "proj", "refs": ["refs/heads/main"]}, self.ctx)
+
+        self.assertEqual(out["status"], "fetch-failed")
+        self._assert_actionable(out["summary"])
+
+    def test_remote_default_branch_auth_failure_is_actionable_server_error(self) -> None:
+        def boom(args, **kwargs):  # noqa: ANN001, ANN003
+            raise git.GitError(
+                "`git ls-remote --symref https://github.com/o/r.git HEAD` failed: "
+                "fatal: Authentication failed for 'https://github.com/o/r.git'"
+            )
+
+        with mock.patch.object(git, "run_git", boom):
+            with self.assertRaises(VerbError) as cm:
+                git._remote_default_branch({"url": "https://github.com/o/r.git"}, self.ctx)
+
+        self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
+        self._assert_actionable(cm.exception.message)
+
+    def test_non_auth_clone_failure_keeps_the_raw_error(self) -> None:
+        # A non-auth failure must NOT be dressed up as an auth problem.
+        self._write_repo_def("proj", sources={"origin": "https://github.com/o/r.git"})
+
+        def boom(args, **kwargs):  # noqa: ANN001, ANN003
+            raise git.GitError("`git clone ...` failed: fatal: could not resolve host")
+
+        with mock.patch.object(git, "run_git", boom):
+            out = git._acquire({"slug": "proj", "refs": []}, self.ctx)
+
+        self.assertEqual(out["status"], "create-failed")
+        self.assertNotIn("gh auth login", out["summary"])
+        self.assertIn("could not resolve host", out["summary"])
 
 
 class MoveDrvfsRegression(GitVerbsCase):

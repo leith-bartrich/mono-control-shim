@@ -6,8 +6,10 @@ dependency like any other. ``unittest`` costs nothing.
 
     python -m unittest discover -s tests -t .
 
-The focus is the GitHub token: it is the only branching logic in the shim with a
-security consequence, and the one thing here that must never be got wrong quietly.
+The focus is the broker: its coordinates and per-run token reach the container
+correctly, and no GitHub credential is resolved or forwarded anymore (host git owns
+credentials now). The generic secret-plumbing is the one branching logic here with a
+security consequence, so it must never be got wrong quietly.
 """
 
 from __future__ import annotations
@@ -23,28 +25,11 @@ from unittest import mock
 
 from mono_control_shim import cli
 
-TOKEN = "ghp_scoped_readonly_example"
+BROKER_TOKEN = "broker-per-run-token-example"
 
 
-def _no_env() -> mock.mock._patch_dict:
-    """An environment with none of the token variables set (and nothing else, either).
-
-    ``clear=True`` is safe because every test here also stubs ``shutil.which``, so
-    nothing consults the real PATH.
-    """
-    return mock.patch.dict(os.environ, {}, clear=True)
-
-
-def _resolve_capturing_stderr() -> tuple[str | None, str]:
-    """Call ``_resolve_github_token``, returning (token, whatever it wrote to stderr)."""
-    stderr = io.StringIO()
-    with contextlib.redirect_stderr(stderr):
-        token = cli._resolve_github_token()
-    return token, stderr.getvalue()
-
-
-def _gh_returning(stdout: str, returncode: int = 0):
-    """Stub ``subprocess.run`` as a `gh auth token` that prints *stdout*."""
+def _run_returning(stdout: str, returncode: int = 0):
+    """Stub ``subprocess.run`` to return a fixed result (e.g. the image-inspect probe)."""
 
     def fake_run(command, **kwargs):  # noqa: ANN001, ANN003
         return subprocess.CompletedProcess(
@@ -54,102 +39,14 @@ def _gh_returning(stdout: str, returncode: int = 0):
     return fake_run
 
 
-class ResolveGitHubToken(unittest.TestCase):
-    """Precedence: our var, then the ecosystem's, then `gh`, then nothing."""
-
-    def test_explicit_var_wins_over_everything(self) -> None:
-        env = {cli.GITHUB_TOKEN_ENV: TOKEN, "GH_TOKEN": "wrong", "GITHUB_TOKEN": "wrong"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"):
-                with mock.patch.object(cli.subprocess, "run") as run:
-                    token, stderr = _resolve_capturing_stderr()
-
-        self.assertEqual(token, TOKEN)
-        run.assert_not_called()  # a scoped token must not trigger the gh fallback
-        self.assertEqual(stderr, "")  # ...nor warn
-
-    def test_gh_token_used_when_ours_is_unset(self) -> None:
-        with mock.patch.dict(os.environ, {"GH_TOKEN": TOKEN}, clear=True):
-            with mock.patch.object(cli.shutil, "which", return_value=None):
-                token, stderr = _resolve_capturing_stderr()
-
-        self.assertEqual(token, TOKEN)
-        self.assertEqual(stderr, "")
-
-    def test_github_token_is_the_last_env_fallback(self) -> None:
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": TOKEN}, clear=True):
-            with mock.patch.object(cli.shutil, "which", return_value=None):
-                token, _ = _resolve_capturing_stderr()
-
-        self.assertEqual(token, TOKEN)
-
-    def test_empty_env_var_is_skipped_not_returned(self) -> None:
-        # An exported-but-empty var must not shadow a real token further down.
-        env = {cli.GITHUB_TOKEN_ENV: "", "GH_TOKEN": TOKEN}
-        with mock.patch.dict(os.environ, env, clear=True):
-            with mock.patch.object(cli.shutil, "which", return_value=None):
-                token, _ = _resolve_capturing_stderr()
-
-        self.assertEqual(token, TOKEN)
-
-    def test_falls_back_to_gh_and_warns_loudly(self) -> None:
-        with _no_env():
-            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"):
-                with mock.patch.object(cli.subprocess, "run", _gh_returning(TOKEN + "\n")):
-                    token, stderr = _resolve_capturing_stderr()
-
-        self.assertEqual(token, TOKEN)  # trailing newline stripped
-        # The convenient path must never also be the silent one.
-        self.assertIn("warning", stderr.lower())
-        self.assertIn("WRITE", stderr)
-        self.assertIn(cli.GITHUB_TOKEN_ENV, stderr)
-        self.assertNotIn(TOKEN, stderr)  # and it must never print the token itself
-
-    def test_no_token_when_gh_is_absent(self) -> None:
-        with _no_env():
-            with mock.patch.object(cli.shutil, "which", return_value=None):
-                token, stderr = _resolve_capturing_stderr()
-
-        self.assertIsNone(token)
-        self.assertEqual(stderr, "")  # absence is normal: public remotes need nothing
-
-    def test_no_token_when_gh_is_not_logged_in(self) -> None:
-        with _no_env():
-            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"):
-                with mock.patch.object(cli.subprocess, "run", _gh_returning("", returncode=1)):
-                    token, _ = _resolve_capturing_stderr()
-
-        self.assertIsNone(token)
-
-    def test_no_token_when_gh_returns_blank(self) -> None:
-        with _no_env():
-            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"):
-                with mock.patch.object(cli.subprocess, "run", _gh_returning("  \n")):
-                    token, stderr = _resolve_capturing_stderr()
-
-        self.assertIsNone(token)
-        self.assertEqual(stderr, "")  # nothing was used, so nothing to warn about
-
-    def test_gh_failure_is_not_fatal(self) -> None:
-        def boom(command, **kwargs):  # noqa: ANN001, ANN003
-            raise OSError("gh exploded")
-
-        with _no_env():
-            with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gh"):
-                with mock.patch.object(cli.subprocess, "run", boom):
-                    token, _ = _resolve_capturing_stderr()
-
-        self.assertIsNone(token)
-
-
 class SecretPlumbing(unittest.TestCase):
-    """The token must reach docker through the environment, never through argv."""
+    """A secret (the broker token) must reach docker through the environment, never argv."""
 
     def test_secret_args_name_the_var_but_not_its_value(self) -> None:
-        args = cli._secret_args({cli.GITHUB_TOKEN_ENV: TOKEN})
+        args = cli._secret_args({cli.BROKER_TOKEN_ENV: BROKER_TOKEN})
 
-        self.assertEqual(args, ["-e", cli.GITHUB_TOKEN_ENV])
-        self.assertNotIn(TOKEN, args)
+        self.assertEqual(args, ["-e", cli.BROKER_TOKEN_ENV])
+        self.assertNotIn(BROKER_TOKEN, args)
 
     def test_no_secrets_means_no_flags(self) -> None:
         self.assertEqual(cli._secret_args({}), [])
@@ -157,31 +54,29 @@ class SecretPlumbing(unittest.TestCase):
 
     def test_secret_environ_carries_the_value_alongside_ours(self) -> None:
         with mock.patch.dict(os.environ, {"EXISTING": "kept"}, clear=True):
-            env = cli._secret_environ({cli.GITHUB_TOKEN_ENV: TOKEN})
+            env = cli._secret_environ({cli.BROKER_TOKEN_ENV: BROKER_TOKEN})
 
         assert env is not None
-        self.assertEqual(env[cli.GITHUB_TOKEN_ENV], TOKEN)
+        self.assertEqual(env[cli.BROKER_TOKEN_ENV], BROKER_TOKEN)
         self.assertEqual(env["EXISTING"], "kept")  # inherited, not replaced
 
     def test_secret_environ_is_none_without_secrets(self) -> None:
-        # None means "inherit ours", keeping the no-token path exactly as it was.
+        # None means "inherit ours", keeping the no-secret path exactly as it was.
         self.assertIsNone(cli._secret_environ({}))
         self.assertIsNone(cli._secret_environ(None))
 
 
-class GitHubTokenStaysOnTheHost(unittest.TestCase):
-    """The GitHub token is no longer handed to the container at all.
+class NoGitHubCredentialIsForwarded(unittest.TestCase):
+    """The shim no longer resolves or forwards any GitHub credential.
 
-    The broker now performs every git effect on the host and holds the token itself
-    (in the ``HostContext``). So the shim must resolve the token — and still feed it to
-    the ``HostContext`` — but must NOT name it to docker: no ``-e MONO_CONTROL_GITHUB_TOKEN``
-    on either backend's command line, and (since it is not forwarded) nothing about it in
-    the environment handed to docker either.
+    Git runs host-side as the developer, so host git owns credentials. The shim must
+    build the ``HostContext`` with no token field, and never name a GitHub token to
+    docker on either backend's command line or in the env handed to docker.
     """
 
-    def _capture(
-        self, *, artifact: bool
-    ) -> tuple[list[str], dict[str, str] | None, str | None]:
+    _GH_TOKEN_ENV = "MONO_CONTROL_GITHUB_TOKEN"
+
+    def _capture(self, *, artifact: bool) -> tuple[list[str], dict[str, str] | None]:
         seen: dict = {}
 
         def fake_exec(cmd, *, env=None):  # noqa: ANN001
@@ -192,87 +87,48 @@ class GitHubTokenStaysOnTheHost(unittest.TestCase):
         real_hostcontext = cli.HostContext
 
         def capturing_hostcontext(**kwargs):  # noqa: ANN003
-            seen["host_token"] = kwargs.get("github_token")
+            # The HostContext must not carry a github_token kwarg anymore.
+            seen["host_kwargs"] = kwargs
             return real_hostcontext(**kwargs)
 
         workspace = mock.MagicMock(spec=cli.Path)
-        # `workspace / "mono-control"` -> a path whose .is_dir() selects the backend.
         workspace.__truediv__.return_value.is_dir.return_value = not artifact
         workspace.__truediv__.return_value.is_file.return_value = True
 
-        # Source the token from the `gh` fallback rather than an env var, so it never
-        # sits in this process's environment — then the env handed to docker can be
-        # asserted clean of it, not merely un-injected. (redirect the fallback warning.)
-        stderr = io.StringIO()
-        with _no_env():
-            with mock.patch.object(cli, "_exec", fake_exec):
-                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/x"):
-                    with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
-                        with mock.patch.object(cli, "HostContext", capturing_hostcontext):
-                            with mock.patch.object(
-                                cli.subprocess, "run", _gh_returning(TOKEN + "\n")
-                            ):
-                                with contextlib.redirect_stderr(stderr):
-                                    cli._dispatch(
-                                        workspace, ["mono-control", "repo", "list"],
-                                        artifact=artifact,
-                                    )
-
-        return seen["cmd"], seen["env"], seen.get("host_token")
-
-    def test_dev_mode_does_not_hand_the_token_to_the_container(self) -> None:
-        cmd, env, host_token = self._capture(artifact=False)
-
-        self.assertIn("compose", cmd)  # sanity: we really took the dev branch
-        self.assertNotIn(TOKEN, " ".join(cmd))  # never in argv
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, cmd)  # ...and not named as a -e flag
-        assert env is not None
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, env)  # ...nor forwarded via docker's env
-        self.assertEqual(host_token, TOKEN)  # but the broker's HostContext DID get it
-
-    def test_artifact_mode_does_not_hand_the_token_to_the_container(self) -> None:
-        cmd, env, host_token = self._capture(artifact=True)
-
-        self.assertIn("run", cmd)
-        self.assertNotIn("compose", cmd)  # sanity: we really took the artifact branch
-        self.assertNotIn(TOKEN, " ".join(cmd))
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, cmd)
-        assert env is not None
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, env)
-        self.assertEqual(host_token, TOKEN)
-
-    def test_no_token_is_a_normal_state_and_reaches_the_host_context_as_none(self) -> None:
-        seen: dict = {}
-
-        def fake_exec(cmd, *, env=None):  # noqa: ANN001
-            seen["cmd"] = cmd
-            seen["env"] = env
-            return 0
-
-        real_hostcontext = cli.HostContext
-
-        def capturing_hostcontext(**kwargs):  # noqa: ANN003
-            seen["host_token"] = kwargs.get("github_token")
-            return real_hostcontext(**kwargs)
-
-        workspace = mock.MagicMock(spec=cli.Path)
-        workspace.__truediv__.return_value.is_dir.return_value = True
-        workspace.__truediv__.return_value.is_file.return_value = True
-
+        # A clean environment: nothing about a GitHub token should appear anywhere,
+        # neither injected into argv nor added to the env handed to docker. (docker
+        # only forwards vars named with a `-e` flag, so a var never named is a var
+        # never forwarded into the container.)
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch.object(cli, "_exec", fake_exec):
-                with mock.patch.object(cli.shutil, "which", side_effect=lambda n: None if n == "gh" else "/usr/bin/docker"):
+                with mock.patch.object(cli.shutil, "which", return_value="/usr/bin/docker"):
                     with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
                         with mock.patch.object(cli, "HostContext", capturing_hostcontext):
-                            cli._dispatch(workspace, ["mono-control", "repo", "list"])
+                            with mock.patch.object(cli.subprocess, "run", _run_returning("")):
+                                cli._dispatch(
+                                    workspace, ["mono-control", "repo", "list"],
+                                    artifact=artifact,
+                                )
 
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["cmd"])
-        assert seen["env"] is not None
-        self.assertNotIn(cli.GITHUB_TOKEN_ENV, seen["env"])
-        self.assertIsNone(seen.get("host_token"))  # no token is a normal state
-        # The env is no longer None because the broker always contributes a secret of
-        # its own (see BrokerInjection); what still holds is that nothing about a GitHub
-        # token reaches docker.
+        self.assertNotIn("github_token", seen["host_kwargs"])  # field is gone
+        return seen["cmd"], seen["env"]
+
+    def test_dev_mode_names_no_github_token_to_docker(self) -> None:
+        cmd, env = self._capture(artifact=False)
+
+        self.assertIn("compose", cmd)  # sanity: the dev branch
+        self.assertNotIn(self._GH_TOKEN_ENV, cmd)  # not named as a -e flag
+        assert env is not None
+        self.assertNotIn(self._GH_TOKEN_ENV, env)  # ...nor added to docker's env
+
+    def test_artifact_mode_names_no_github_token_to_docker(self) -> None:
+        cmd, env = self._capture(artifact=True)
+
+        self.assertIn("run", cmd)
+        self.assertNotIn("compose", cmd)  # sanity: the artifact branch
+        self.assertNotIn(self._GH_TOKEN_ENV, cmd)
+        assert env is not None
+        self.assertNotIn(self._GH_TOKEN_ENV, env)
 
 
 class BrokerInjection(unittest.TestCase):
@@ -296,7 +152,7 @@ class BrokerInjection(unittest.TestCase):
                     with mock.patch.object(cli, "_detect_host_platform", return_value="linux"):
                         with mock.patch.object(cli, "_warn_if_workspace_incomplete", return_value=None):
                             with mock.patch.object(
-                                cli.subprocess, "run", _gh_returning("")
+                                cli.subprocess, "run", _run_returning("")
                             ):
                                 cli._dispatch(workspace, ["mono-control"], artifact=artifact)
 

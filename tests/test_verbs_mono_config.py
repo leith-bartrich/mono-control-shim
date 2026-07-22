@@ -23,7 +23,6 @@ class MonoConfigCase(unittest.TestCase):
             workspace_root=root / "mono-repos",
             offline_root=root / "mono-repos-offline",
             config_dir=self.config,
-            github_token=None,
         )
 
     def test_get_repo_defs_empty(self) -> None:
