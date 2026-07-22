@@ -267,6 +267,21 @@ class GitRepo:
         # the caller has already checked it is bare hex, this is defense in depth.
         self._git("checkout", ref, "--")
 
+    def set_remote(self, name: str, url: str) -> None:
+        """Point remote ``name`` at ``url``: add it, or repoint it if it exists.
+
+        Relocated verbatim from the deleted container-side ``GitRepo.set_remote``:
+        a purely local config edit (no network, no credential env). Membership is
+        checked against ``git remote``'s listing — not inferred from a failing
+        ``add`` — so the add / set-url choice is explicit. Caller has already
+        validated ``name`` (bare remote name) and ``url`` (https only).
+        """
+        existing = self._git("remote").split()
+        if name in existing:
+            self._git("remote", "set-url", name, url)
+        else:
+            self._git("remote", "add", name, url)
+
     def _apply_profile(self, profile: FsProfile) -> None:
         for key, attr in _PROFILE_KEYS:
             self._git("config", key, "true" if getattr(profile, attr) else "false")
@@ -415,6 +430,19 @@ def _valid_slug(slug: Any) -> str:
     if not isinstance(slug, str) or not _SLUG_RE.fullmatch(slug):
         raise VerbError(INVALID_PARAMS, f"invalid slug: {slug!r}")
     return slug
+
+
+def _valid_remote_name(name: Any) -> str:
+    """Return ``name`` if it is a bare git remote name; else reject.
+
+    Held to the same character class as a slug (``_SLUG_RE``): a plain name, no
+    separators and no ``..``, so it cannot smuggle a path, an option, or a refspec
+    into ``git remote add/set-url``. It is written verbatim into ``.git/config`` as
+    a section key, so constraining it here is the security boundary for that write.
+    """
+    if not isinstance(name, str) or not _SLUG_RE.fullmatch(name):
+        raise VerbError(INVALID_PARAMS, f"invalid remote name: {name!r}")
+    return name
 
 
 def _valid_hex_commit(commit: Any) -> str:
@@ -834,3 +862,35 @@ def _ls_remote_symref_hardened(url: str) -> Optional[str]:
         env=_noninteractive_env(https_only=True),
         config=_noninteractive_config(),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Verb: set_remote (add / repoint a remote on a managed checkout)
+# --------------------------------------------------------------------------- #
+@verb("set_remote")
+def _set_remote(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
+    """Add or repoint remote ``name`` -> ``url`` on ``slug``'s on-disk checkout.
+
+    The fork-adoption flow's effecting half: it relocates the deleted container-side
+    ``GitRepo.set_remote`` onto host git. A LOCAL config edit only — no network, no
+    credential env — but the ``url`` is written into ``.git/config`` and *later*
+    fetched, so it is constrained exactly like ``remote_default_branch``'s: https
+    only, no ``::`` transport helper. ``name`` is held to a bare remote name so it
+    cannot smuggle a path or flag into the config write.
+
+    Wire (plain JSON, no request model — match the other verbs):
+        ``SetRemoteRequest`` = ``{"slug": str, "name": str, "url": str}``
+        result = ``OkResult`` = ``{"ok": True}``
+    """
+    ctx = _require_ctx(ctx)
+    slug = _valid_slug(params.get("slug"))
+    name = _valid_remote_name(params.get("name"))
+    url = _sanitize_remote_url(params.get("url"))
+    observed = _location_of(ctx, slug)
+    if observed is None:
+        # The container only calls this after observing the repo on disk; re-verify
+        # rather than trust that, so a vanished / never-materialized slug is a clean
+        # reported failure, not a git error against a guessed path.
+        raise VerbError(SERVER_ERROR, f"{slug!r} is not on disk")
+    GitRepo(observed.location).set_remote(name, url)
+    return {"ok": True}

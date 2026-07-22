@@ -83,6 +83,7 @@ class Registration(unittest.TestCase):
             "read_layout",
             "write_layout",
             "remote_default_branch",
+            "set_remote",
             # mono_config pack
             "get_repo_defs",
             "save_repo_def",

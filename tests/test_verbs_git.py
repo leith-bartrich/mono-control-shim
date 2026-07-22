@@ -279,6 +279,79 @@ class GitVerbsCase(unittest.TestCase):
         self.assertEqual(git.ls_remote_symref(str(bare)), "main")
 
 
+class SetRemote(GitVerbsCase):
+    """``set_remote`` adds or repoints a remote on a managed checkout (local, no net)."""
+
+    def _remote_url(self, checkout: Path, name: str) -> str:
+        return _git(["remote", "get-url", name], checkout)
+
+    def test_set_remote_adds_when_absent(self) -> None:
+        self._acquire_offline("proj")
+        url = "https://github.com/o/fork.git"
+        self.assertEqual(
+            git._set_remote({"slug": "proj", "name": "upstream", "url": url}, self.ctx),
+            {"ok": True},
+        )
+        self.assertEqual(self._remote_url(self.offline / "proj", "upstream"), url)
+
+    def test_set_remote_repoints_existing(self) -> None:
+        self._acquire_offline("proj")
+        checkout = self.offline / "proj"
+        _git(["remote", "add", "origin2", "https://github.com/o/old.git"], checkout)
+        new_url = "https://github.com/o/new.git"
+        self.assertEqual(
+            git._set_remote(
+                {"slug": "proj", "name": "origin2", "url": new_url}, self.ctx
+            ),
+            {"ok": True},
+        )
+        self.assertEqual(self._remote_url(checkout, "origin2"), new_url)
+
+    def test_set_remote_repoints_repo_default_origin(self) -> None:
+        # ``acquire`` clones, so ``origin`` already exists — repoint it in place.
+        self._acquire_offline("proj")
+        new_url = "https://github.com/o/moved.git"
+        git._set_remote({"slug": "proj", "name": "origin", "url": new_url}, self.ctx)
+        self.assertEqual(self._remote_url(self.offline / "proj", "origin"), new_url)
+
+    def test_set_remote_not_on_disk_is_server_error(self) -> None:
+        self._write_repo_def("ghost", sources=None)  # def exists, nothing on disk
+        with self.assertRaises(VerbError) as cm:
+            git._set_remote(
+                {"slug": "ghost", "name": "origin", "url": "https://github.com/o/r.git"},
+                self.ctx,
+            )
+        self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
+
+    def test_set_remote_rejects_invalid_slug(self) -> None:
+        for bad in ("../escape", "a/b", "..", "", ".hidden"):
+            with self.assertRaises(VerbError) as cm:
+                git._set_remote(
+                    {"slug": bad, "name": "origin", "url": "https://github.com/o/r.git"},
+                    self.ctx,
+                )
+            self.assertEqual(cm.exception.code, broker.INVALID_PARAMS)
+
+    def test_set_remote_rejects_bad_remote_name(self) -> None:
+        self._acquire_offline("proj")
+        for bad in ("a/b", "../x", "..", "", ".hidden", "-flag"):
+            with self.assertRaises(VerbError) as cm:
+                git._set_remote(
+                    {"slug": "proj", "name": bad, "url": "https://github.com/o/r.git"},
+                    self.ctx,
+                )
+            self.assertEqual(cm.exception.code, broker.INVALID_PARAMS)
+
+    def test_set_remote_rejects_non_https_or_helper_url(self) -> None:
+        self._acquire_offline("proj")
+        for bad in ("file:///etc/passwd", "ext::sh -c id", "ssh://host/x", "http://x/y", "/local/path"):
+            with self.assertRaises(VerbError) as cm:
+                git._set_remote(
+                    {"slug": "proj", "name": "upstream", "url": bad}, self.ctx
+                )
+            self.assertEqual(cm.exception.code, broker.INVALID_PARAMS)
+
+
 class Validators(GitVerbsCase):
     """The boundary rejects hostile input before touching disk or spawning git."""
 
