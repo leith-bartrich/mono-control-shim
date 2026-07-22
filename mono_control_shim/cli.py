@@ -177,10 +177,12 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
 
 # Directories that `mproj init` ensures exist in the workspace root. The broker acts
 # on these host-side dirs directly (they feed the HostContext), so they are no longer
-# bind-mounted into the container, but they MUST still exist on the host: mono-repos is
-# the materialized root, mono-repos-offline the non-destructive retire holding area
-# (whose unpushed work would be lost if it were absent), and mono-config the manifest dir.
-INIT_DIRS = ("mono-repos", "mono-repos-offline", "mono-config")
+# bind-mounted into the container, but they MUST still exist on the host: mono-repos-bare
+# holds the bare repositories (one per slug — the durable store; a repo never moves out of
+# it), mono-work holds the worktrees a repo is materialized into, and mono-config the
+# manifest dir. Committed work is safe in the bare repo, so a discarded worktree loses
+# nothing that was committed.
+INIT_DIRS = ("mono-repos-bare", "mono-work", "mono-config")
 
 
 def _run_status(workspace: Path) -> int:
@@ -195,9 +197,9 @@ def _run_status(workspace: Path) -> int:
 
 
 def _run_init(workspace: Path) -> int:
-    """Ensure the workspace has the directories the dev container bind-mounts.
+    """Ensure the workspace has the managed directories the broker acts on.
 
-    Creates ``mono-repos/``, ``mono-repos-offline/`` and ``mono-config/`` in the
+    Creates ``mono-repos-bare/``, ``mono-work/`` and ``mono-config/`` in the
     workspace root if they are missing. Idempotent: already-present directories are
     left untouched.
     """
@@ -228,7 +230,7 @@ def _warn_if_workspace_incomplete(workspace: Path) -> None:
     missing-dir hint that used to ride along with the (now removed) bind mounts is
     preserved here as a pure existence check that mounts nothing.
     """
-    for name in INIT_DIRS:  # mono-repos, mono-repos-offline, mono-config
+    for name in INIT_DIRS:  # mono-repos-bare, mono-work, mono-config
         source = workspace / name
         if not source.is_dir():
             print(f"warning: {source} does not exist; run `mproj init`.", file=sys.stderr)
@@ -288,13 +290,13 @@ def _dispatch(
     # Importing the verb packs is what registers their handlers (@verb runs at import);
     # the host context carries the host paths those handlers act on — knowledge the
     # container cannot have and must not be handed. The paths are the managed workspace
-    # dirs (INIT_DIRS): mono-repos is the materialized root, mono-repos-offline the
-    # offline holding area, mono-config the manifest dir.
+    # dirs (INIT_DIRS): mono-repos-bare holds the bare repositories, mono-work holds the
+    # worktrees they are materialized into, mono-config the manifest dir.
     from mono_control_shim import verbs  # noqa: F401  (import = register packs)
 
     host_context = HostContext(
-        workspace_root=workspace / "mono-repos",
-        offline_root=workspace / "mono-repos-offline",
+        work_root=workspace / "mono-work",
+        bare_root=workspace / "mono-repos-bare",
         config_dir=workspace / "mono-config",
     )
 
@@ -403,7 +405,7 @@ def _dev_run(
     cmd += _secret_args(secrets)
     # Mount live source over the baked copy so working-tree edits are reflected,
     # plus a persistent uv cache so repeated runs don't re-download deps. The managed
-    # workspace dirs (mono-repos / -offline / mono-config) are NOT mounted: the broker
+    # workspace dirs (mono-repos-bare / mono-work / mono-config) are NOT mounted: the broker
     # touches them on the host. Still warn if they are missing — the broker needs them.
     cmd += ["-v", f"{workspace / 'mono-control'}:/workspaces/mono-control"]
     cmd += ["-v", f"{_UV_CACHE_VOLUME}:/home/codespace/.cache/uv"]
@@ -594,8 +596,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
     init_parser = subparsers.add_parser(
         "init",
-        help="Create the mono-repos/, mono-repos-offline/ and mono-config/ "
-        "directories the container bind-mounts, if they do not already exist.",
+        help="Create the mono-repos-bare/, mono-work/ and mono-config/ "
+        "directories the broker acts on, if they do not already exist.",
     )
     _add_workspace_arg(init_parser)
 

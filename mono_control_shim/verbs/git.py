@@ -1,25 +1,30 @@
 """The ``git`` verb pack: the host-side git + filesystem effects.
 
-This re-hosts, natively on the host, the call layer PR #18 deleted from the
-container (``git/repo.py``, ``git/runner.py``, the source engine's
-clone/init/fetch decision tree, ``engines/layout/execute.py``'s move, and
-``on_disk/scanner.py``'s walk). The behavioral reference is that deleted code
-and ``mono-control/tests/broker_shim.py`` — the in-process fake the container's
-whole suite passes against. These verbs perform the *same* operations with the
-*same* request/response shapes, differing only in that they run against the real
-host paths and host git rather than a temp fixture.
+Physical model: **bare repos + git worktrees**. Every managed repository is a
+*bare* repo under ``bare_root`` (``mono-repos-bare``) that is created once and
+**never moves**; placing it into the workspace is an additive ``git worktree add``
+under ``work_root`` (``mono-work``), and retiring it is ``git worktree remove``.
+This replaces the earlier "clone into an offline dir, then ``os.rename`` it into
+the workspace" model, whose move failed with ``WinError 5`` / ``EACCES`` when an
+IDE (or drvfs) held the directory being renamed. A worktree add moves nothing that
+anything holds, so the class of failure is gone by construction.
 
-Why native, not in the container: git and ``os.rename`` here run on the host's
-own filesystem (NTFS), so the move never crosses the 9p/drvfs bind-mount seam —
-which is exactly what made the original ``EACCES``-on-move bug possible.
+This re-hosts, natively on the host, the call layer PR #18 deleted from the
+container. The behavioral reference is that deleted code and
+``mono-control/tests/broker_shim.py`` — the in-process fake the container's whole
+suite passes against. These verbs perform the *same* operations with the *same*
+request/response shapes (the ``state`` literal stays ``"offline"`` / ``"materialized"``,
+reinterpreted: **offline = a bare repo with no worktree**, **materialized = a bare
+repo with a worktree under ``work_root``**), differing only in that they run against
+the real host paths and host git rather than a temp fixture.
 
 Security surface. This module is where container-supplied input meets the host,
 so every verb validates at the boundary before it touches disk or spawns git:
 
 * a slug must be a bare name — never a path — so it cannot escape the config or
-  offline roots (``../../etc``);
+  bare roots (``../../etc``);
 * a layout ``location`` is normalized *inside* the workspace root, and a
-  symlinked parent that would redirect the move out of it is refused;
+  symlinked parent that would redirect the worktree out of it is refused;
 * a ``checkout`` commit must be hex — never a ref or an option — so it cannot
   smuggle a flag or a branch name into ``git checkout``;
 * ``remote_default_branch``'s URL comes from the container (guided-add is still
@@ -39,17 +44,15 @@ TTY prompt or a GUI popup; the failure is then reworded into an actionable
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Optional
 
 from mono_control_shim.broker import (
     INVALID_PARAMS,
@@ -59,12 +62,17 @@ from mono_control_shim.broker import (
     verb,
 )
 
-# The stamp that makes a checkout self-identifying. Reading it (location -> slug)
-# needs no external index; its absence marks a foreign / unmanaged tree.
+# The stamp that makes a bare repo self-identifying. Reading it (dir -> slug) needs
+# no external index; its absence marks a foreign / unmanaged repo. It is stamped into
+# the bare repo's config, so every worktree added off that bare inherits it.
 _SLUG_KEY = "mono-control.slug"
 
+# The cluster layout document, relative to a repo's working tree (a worktree, or the
+# committed tree read out of the bare repo's HEAD).
+_LAYOUT_REL = "product-cluster/default-layout.json"
+
 # FS-capability config stamped at create time, in (git config key, attr) form —
-# so every later git on the tree (ours or a developer's) behaves consistently.
+# so every later git on the repo (ours or a developer's) behaves consistently.
 _PROFILE_KEYS = (
     ("core.filemode", "filemode"),
     ("core.symlinks", "symlinks"),
@@ -150,7 +158,7 @@ class GitError(Exception):
 
 
 class UnmanagedCheckoutError(GitError):
-    """A checkout carries no ``mono-control.slug`` stamp (foreign / unmanaged)."""
+    """A repo carries no ``mono-control.slug`` stamp (foreign / unmanaged)."""
 
 
 def run_git(
@@ -217,16 +225,30 @@ def _noninteractive_env(*, https_only: bool = False) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# A handle on a working tree (relocated from git/repo.py)
+# A handle on a git directory — a bare repo or a worktree (relocated from git/repo.py)
 # --------------------------------------------------------------------------- #
 class GitRepo:
-    """A handle on a git working tree at ``path``."""
+    """A handle on a git directory at ``path`` (a bare repo, or one of its worktrees).
+
+    Every method runs ``git -C <path> ...``, so the same handle works for a bare
+    repo (config / rev-parse / worktree management / ``show``) and for a worktree
+    (status / checkout). The worktree-management methods are only meaningful on the
+    bare repo, whose config governs its whole worktree family.
+    """
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
 
     def _git(self, *args: str) -> str:
         return run_git(list(args), cwd=self.path)
+
+    def is_bare_repository(self) -> bool:
+        """True if ``path`` is a bare repository; False if it is a worktree or not a
+        git dir at all (``rev-parse`` failing is treated as 'not a managed bare')."""
+        try:
+            return self._git("rev-parse", "--is-bare-repository") == "true"
+        except GitError:
+            return False
 
     def current_commit(self) -> Optional[str]:
         return self.resolve_ref("HEAD")
@@ -270,8 +292,7 @@ class GitRepo:
     def set_remote(self, name: str, url: str) -> None:
         """Point remote ``name`` at ``url``: add it, or repoint it if it exists.
 
-        Relocated verbatim from the deleted container-side ``GitRepo.set_remote``:
-        a purely local config edit (no network, no credential env). Membership is
+        A purely local config edit (no network, no credential env). Membership is
         checked against ``git remote``'s listing — not inferred from a failing
         ``add`` — so the add / set-url choice is explicit. Caller has already
         validated ``name`` (bare remote name) and ``url`` (https only).
@@ -281,6 +302,51 @@ class GitRepo:
             self._git("remote", "set-url", name, url)
         else:
             self._git("remote", "add", name, url)
+
+    def show_head_blob(self, rel: str) -> str:
+        """Return the contents of ``rel`` as committed at HEAD (``git show HEAD:rel``).
+
+        Reads a file out of the bare repo without a worktree. Raises ``GitError`` if
+        HEAD has no such path (or there is no HEAD yet).
+        """
+        return self._git("show", f"HEAD:{rel}")
+
+    # -- worktree management (meaningful on the bare repo) ------------------- #
+    def worktree_add(self, dest: Path, ref: str) -> None:
+        """Materialize a worktree at ``dest`` checked out at ``ref`` (additive)."""
+        self._git("worktree", "add", str(dest), ref)
+
+    def worktree_move(self, src: Path, dst: Path) -> None:
+        """Move the worktree at ``src`` to ``dst`` (native; preserves its state)."""
+        self._git("worktree", "move", str(src), str(dst))
+
+    def worktree_remove(self, path: Path) -> None:
+        """Remove the worktree at ``path`` (the bare repo — and its commits — survive)."""
+        self._git("worktree", "remove", str(path))
+
+    def worktree_under(self, root: Path) -> Optional[Path]:
+        """The path of this bare repo's worktree that lives under ``root``, or ``None``.
+
+        Parses ``git worktree list --porcelain``: the bare repo lists itself with a
+        ``bare`` marker (skipped); a real worktree lists its path and HEAD. The first
+        worktree whose resolved path is at or under ``root`` is returned.
+        """
+        out = self._git("worktree", "list", "--porcelain")
+        root_real = root.resolve()
+        for record in out.split("\n\n"):
+            lines = record.splitlines()
+            if not lines or not lines[0].startswith("worktree "):
+                continue
+            if any(line == "bare" for line in lines):
+                continue  # the bare repo's own entry, not a worktree
+            wt = Path(lines[0][len("worktree "):])
+            try:
+                wt_real = wt.resolve()
+            except OSError:  # pragma: no cover - defensive
+                continue
+            if wt_real == root_real or root_real in wt_real.parents:
+                return wt
+        return None
 
     def _apply_profile(self, profile: FsProfile) -> None:
         for key, attr in _PROFILE_KEYS:
@@ -303,22 +369,22 @@ def clone(
     profile: FsProfile,
     slug: str,
 ) -> GitRepo:
-    """Clone ``url`` into ``dest``, stamping ``profile`` + ``slug`` before checkout.
+    """Clone ``url`` into a **bare** repo at ``dest``, stamping ``profile`` + ``slug``.
 
-    ``--no-checkout`` so the stamp governs the working-tree population (notably
-    symlink / filemode handling). Network call: runs under the non-interactive
-    posture, letting host git resolve credentials or fail fast.
+    ``--bare`` — there is no working tree to check out; a worktree is added later by
+    ``place``. The stamp and FS-capability profile go into the bare repo's config, so
+    every worktree added off it inherits them. Network call: runs under the
+    non-interactive posture, letting host git resolve credentials or fail fast.
     """
     dest = Path(dest)
     run_git(
-        ["clone", "--no-checkout", str(url), str(dest)],
+        ["clone", "--bare", str(url), str(dest)],
         env=_noninteractive_env(),
         config=_noninteractive_config(),
     )
     repo = GitRepo(dest)
     repo._apply_profile(profile)
     repo._apply_slug(slug)
-    repo._git("checkout", "HEAD", "--", ".")
     return repo
 
 
@@ -329,9 +395,9 @@ def init(
     slug: str,
     initial_branch: Optional[str] = None,
 ) -> GitRepo:
-    """Initialize a new empty repo at ``path`` and stamp ``profile`` + ``slug``."""
+    """Initialize a new empty **bare** repo at ``path`` and stamp ``profile`` + ``slug``."""
     path = Path(path)
-    args = ["init"]
+    args = ["init", "--bare"]
     if initial_branch is not None:
         args += ["--initial-branch", initial_branch]
     args.append(str(path))
@@ -370,50 +436,6 @@ def ls_remote_symref(
 
 
 # --------------------------------------------------------------------------- #
-# Scanner walk + atomic move (relocated from scanner.py / execute.py)
-# --------------------------------------------------------------------------- #
-def _find_checkouts(root: Path) -> Iterator[Path]:
-    """Yield each subtree under ``root`` containing a ``.git`` (descent stops there)."""
-    if not root.is_dir():
-        return
-    stack: list[Path] = [root]
-    while stack:
-        current = stack.pop()
-        if (current / ".git").exists():
-            yield current
-            continue
-        try:
-            stack.extend(p for p in current.iterdir() if p.is_dir())
-        except PermissionError:  # pragma: no cover
-            continue
-
-
-def _move(src: Path, dst: Path) -> None:
-    """Move ``src`` -> ``dst``, publishing atomically; raise ``OSError`` families.
-
-    Fast path is ``os.rename`` (single syscall — no partially-moved tree ever
-    appears). ``FileExistsError`` when the destination is occupied. Across
-    filesystems (``EXDEV`` — separate mounts) fall back to a copy that still
-    publishes atomically: copy to a hidden temp dir on the destination filesystem,
-    then rename it into place and drop the source.
-    """
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists():
-        raise FileExistsError(dst)
-    try:
-        os.rename(src, dst)
-        return
-    except OSError as e:
-        if e.errno not in (errno.EXDEV,):
-            raise
-    tmp = dst.parent / f".{dst.name}.tmp-move"
-    shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(src, tmp, symlinks=True)
-    os.rename(tmp, dst)
-    shutil.rmtree(src)
-
-
-# --------------------------------------------------------------------------- #
 # Input validation (the security boundary)
 # --------------------------------------------------------------------------- #
 _SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -424,7 +446,7 @@ def _valid_slug(slug: Any) -> str:
     """Return ``slug`` if it is a bare, safe name; else reject with INVALID_PARAMS.
 
     A slug indexes files (``<config>/repos/<slug>.json``) and directories
-    (``<offline>/<slug>``), so it must never be a path: no separators, no ``..``,
+    (``<bare_root>/<slug>``), so it must never be a path: no separators, no ``..``,
     no leading dot. That keeps a hostile slug from escaping a root.
     """
     if not isinstance(slug, str) or not _SLUG_RE.fullmatch(slug):
@@ -437,8 +459,8 @@ def _valid_remote_name(name: Any) -> str:
 
     Held to the same character class as a slug (``_SLUG_RE``): a plain name, no
     separators and no ``..``, so it cannot smuggle a path, an option, or a refspec
-    into ``git remote add/set-url``. It is written verbatim into ``.git/config`` as
-    a section key, so constraining it here is the security boundary for that write.
+    into ``git remote add/set-url``. It is written verbatim into the config as a
+    section key, so constraining it here is the security boundary for that write.
     """
     if not isinstance(name, str) or not _SLUG_RE.fullmatch(name):
         raise VerbError(INVALID_PARAMS, f"invalid remote name: {name!r}")
@@ -460,8 +482,8 @@ def _resolve_inside(root: Path, location: Any) -> Path:
     """Resolve a container-supplied ``location`` to an absolute path inside ``root``.
 
     Rejects absolutes and any ``..`` component, then guards against a symlinked
-    parent that would redirect the move out of the workspace: the nearest existing
-    ancestor of the destination must still resolve within ``root``.
+    parent that would redirect the worktree out of the workspace: the nearest
+    existing ancestor of the destination must still resolve within ``root``.
     """
     if not isinstance(location, str) or not location:
         raise VerbError(INVALID_PARAMS, f"invalid location: {location!r}")
@@ -510,46 +532,56 @@ def _require_ctx(ctx: Optional[HostContext]) -> HostContext:
 
 
 # --------------------------------------------------------------------------- #
-# Observation
+# Observation (scan the bare root; a worktree under work_root => materialized)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class _Observed:
     slug: str
-    location: Path  # absolute
+    bare: Path  # absolute path to the bare repo (always present)
+    worktree: Optional[Path]  # absolute worktree path if materialized, else None
     state: str  # "materialized" | "offline"
     commit: Optional[str]
     dirty: bool
 
 
-def _observe(checkout: Path, state: str) -> Optional[_Observed]:
-    repo = GitRepo(checkout)
+def _observe(ctx: HostContext, bare: Path) -> Optional[_Observed]:
+    """Observe one bare repo. ``None`` if it is unstamped (foreign / unmanaged).
+
+    Offline = the bare repo has no worktree under ``work_root``; its ``commit`` is the
+    bare HEAD (``None`` for an empty init) and it is never dirty. Materialized = it
+    has such a worktree; ``commit`` and ``dirty`` are read from that worktree.
+    """
+    repo = GitRepo(bare)
     try:
         slug = repo.slug()
     except UnmanagedCheckoutError:
         return None
-    return _Observed(
-        slug=slug,
-        location=checkout,
-        state=state,
-        commit=repo.current_commit(),
-        dirty=repo.is_dirty(),
-    )
+    wt = repo.worktree_under(ctx.work_root)
+    if wt is not None:
+        tree = GitRepo(wt)
+        return _Observed(slug, bare, wt, "materialized", tree.current_commit(), tree.is_dirty())
+    return _Observed(slug, bare, None, "offline", repo.current_commit(), False)
 
 
-def _inventory(ctx: HostContext) -> tuple[dict[str, _Observed], list[tuple[Path, str]]]:
-    """Walk both roots. First observation of a slug wins (workspace before offline)."""
+def _inventory(ctx: HostContext) -> tuple[dict[str, _Observed], list[Path]]:
+    """Iterate ``bare_root/*``: managed bares keyed by slug, plus unstamped bares.
+
+    Only *bare repositories* are considered (``rev-parse --is-bare-repository``);
+    anything else under the root is ignored. A bare with no slug stamp is reported
+    unmanaged. First observation of a slug wins (defensive against a duplicate stamp).
+    """
     repos: dict[str, _Observed] = {}
-    unmanaged: list[tuple[Path, str]] = []
-    for root, state in (
-        (ctx.workspace_root, "materialized"),
-        (ctx.offline_root, "offline"),
-    ):
-        for checkout in _find_checkouts(root):
-            observed = _observe(checkout, state)
-            if observed is None:
-                unmanaged.append((checkout, state))
-            elif observed.slug not in repos:
-                repos[observed.slug] = observed
+    unmanaged: list[Path] = []
+    if not ctx.bare_root.is_dir():
+        return repos, unmanaged
+    for entry in sorted(ctx.bare_root.iterdir()):
+        if not entry.is_dir() or not GitRepo(entry).is_bare_repository():
+            continue
+        observed = _observe(ctx, entry)
+        if observed is None:
+            unmanaged.append(entry)
+        elif observed.slug not in repos:
+            repos[observed.slug] = observed
     return repos, unmanaged
 
 
@@ -561,32 +593,37 @@ def _relative(location: Path, root: Path) -> str:
     return location.relative_to(root).as_posix()
 
 
+def _wire_location(ctx: HostContext, obs: _Observed) -> str:
+    """The ``WireRepo`` location: worktree-relative when materialized, else the slug."""
+    if obs.state == "materialized" and obs.worktree is not None:
+        return _relative(obs.worktree, ctx.work_root)
+    return _relative(obs.bare, ctx.bare_root)
+
+
 # --------------------------------------------------------------------------- #
 # Verb: scan
 # --------------------------------------------------------------------------- #
 @verb("scan")
 def _scan(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Walk workspace + offline roots into a ``WireInventory`` (relative + state)."""
+    """Walk the bare root into a ``WireInventory`` (relative location + state)."""
     ctx = _require_ctx(ctx)
     repos, unmanaged = _inventory(ctx)
-
-    def root_for(state: str) -> Path:
-        return ctx.workspace_root if state == "materialized" else ctx.offline_root
-
     return {
         "repos": [
             {
                 "slug": obs.slug,
-                "location": _relative(obs.location, root_for(obs.state)),
+                "location": _wire_location(ctx, obs),
                 "state": obs.state,
                 "commit": obs.commit,
                 "dirty": obs.dirty,
             }
             for obs in repos.values()
         ],
+        # An unstamped bare has no worktree by definition, so it reports as offline,
+        # located by its dir name relative to the bare root.
         "unmanaged": [
-            {"location": _relative(path, root_for(state)), "state": state}
-            for path, state in unmanaged
+            {"location": _relative(path, ctx.bare_root), "state": "offline"}
+            for path in unmanaged
         ],
     }
 
@@ -651,8 +688,10 @@ def _verify_refs(
 def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
     """Make ``refs`` locally resolvable for ``slug``: clone / init / fetch + verify.
 
-    Owns the clone-vs-init-vs-fetch decision. The source URL is resolved from the
-    host repo def only — a URL is never accepted from the container here.
+    Owns the clone-vs-init-vs-fetch decision. The repo is a **bare** repo at
+    ``bare_root/<slug>``; there is no worktree yet (``place`` adds one later). The
+    source URL is resolved from the host repo def only — a URL is never accepted from
+    the container here.
     """
     ctx = _require_ctx(ctx)
     slug = _valid_slug(params.get("slug"))
@@ -667,7 +706,7 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
     observed = _location_of(ctx, slug)
 
     if observed is None:
-        # Absent locally -> create.
+        # Absent locally -> create the bare repo.
         if source_url is None:
             if refs:
                 return _src(
@@ -677,7 +716,7 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
                 )
             try:
                 init(
-                    ctx.offline_root / slug,
+                    ctx.bare_root / slug,
                     profile=profile,
                     slug=slug,
                     initial_branch=initial_branch,
@@ -686,15 +725,15 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
                 return _src("create-failed", f"init {slug!r} failed: {e}")
             return _src("initialized", f"initialized {slug!r}")
         try:
-            repo = clone(source_url, ctx.offline_root / slug, profile=profile, slug=slug)
+            repo = clone(source_url, ctx.bare_root / slug, profile=profile, slug=slug)
         except GitError as e:
             if is_auth_failure(str(e)):
                 return _src("create-failed", _auth_summary(slug))
             return _src("create-failed", f"clone {slug!r} failed: {e}")
         return _verify_refs(repo, refs, "cloned", f"cloned {slug!r}", slug)
 
-    # Present locally (offline or materialized) -> fetch (if there is a source).
-    repo = GitRepo(observed.location)
+    # Present locally (offline or materialized) -> fetch on the bare repo.
+    repo = GitRepo(observed.bare)
     if source_url is not None:
         try:
             repo.fetch("origin")
@@ -721,71 +760,84 @@ def _race(verb_name: str, slug: str, detail: str) -> dict[str, Any]:
     return {"status": "race-aborted", "summary": f"{verb_name} aborted for {slug!r}: {detail}"}
 
 
-def _move_into_workspace(
-    ctx: HostContext, params: dict[str, Any], ok_status: str, verb_name: str
-) -> dict[str, Any]:
-    slug = _valid_slug(params.get("slug"))
-    dst = _resolve_inside(ctx.workspace_root, params.get("location"))
-    observed = _location_of(ctx, slug)
-    if observed is None:
-        return _race(verb_name, slug, "checkout vanished")
-    location = _relative(dst, ctx.workspace_root)
-    try:
-        _move(observed.location, dst)
-    except FileExistsError:
-        return _race(verb_name, slug, f"destination {location} is occupied")
-    except OSError as e:
-        return _lay("failed", f"{verb_name} {slug!r} failed: {e}")
-    return _lay(ok_status, f"{verb_name}d {slug!r} at {location}")
-
-
 @verb("place")
 def _place(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Move ``slug`` (offline) into ``location`` under the workspace root."""
-    return _move_into_workspace(_require_ctx(ctx), params, "placed", "place")
+    """Materialize ``slug`` as a worktree at ``location`` under the work root.
+
+    ``git worktree add`` off the bare repo — additive, so it moves nothing an IDE
+    holds. The worktree is created at the bare repo's default ``HEAD``; the exact
+    commit is set by the composite ``checkout`` the container issues right after.
+    """
+    ctx = _require_ctx(ctx)
+    slug = _valid_slug(params.get("slug"))
+    dst = _resolve_inside(ctx.work_root, params.get("location"))
+    observed = _location_of(ctx, slug)
+    if observed is None:
+        return _race("place", slug, "repository vanished")
+    location = _relative(dst, ctx.work_root)
+    if dst.exists():
+        return _race("place", slug, f"destination {location} is occupied")
+    try:
+        GitRepo(observed.bare).worktree_add(dst, "HEAD")
+    except GitError as e:
+        return _lay("failed", f"place {slug!r} failed: {e}")
+    return _lay("placed", f"placed {slug!r} at {location}")
 
 
 @verb("relocate")
 def _relocate(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Move ``slug`` between two materialized locations."""
-    return _move_into_workspace(_require_ctx(ctx), params, "relocated", "relocate")
+    """Move ``slug``'s worktree to a new ``location`` (native ``git worktree move``)."""
+    ctx = _require_ctx(ctx)
+    slug = _valid_slug(params.get("slug"))
+    dst = _resolve_inside(ctx.work_root, params.get("location"))
+    observed = _location_of(ctx, slug)
+    if observed is None or observed.worktree is None:
+        return _race("relocate", slug, "worktree vanished")
+    location = _relative(dst, ctx.work_root)
+    if dst.exists():
+        return _race("relocate", slug, f"destination {location} is occupied")
+    # ``git worktree move`` (unlike ``worktree add``) does not create intermediate
+    # parent dirs, so make the destination's parent before handing it the leaf.
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        GitRepo(observed.bare).worktree_move(observed.worktree, dst)
+    except GitError as e:
+        return _lay("failed", f"relocate {slug!r} failed: {e}")
+    return _lay("relocated", f"relocated {slug!r} at {location}")
 
 
 @verb("retire")
 def _retire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Move ``slug`` from the workspace back to its offline holding spot.
+    """Remove ``slug``'s worktree; the bare repo (and its commits) survive.
 
-    Non-destructive: the destination is derived from the slug (``location`` is
-    ignored), and an already-occupied offline spot is a ``blocked`` precondition,
-    not a race.
+    ``location`` is ignored — the worktree is derived from the slug. Dirty-gated:
+    committed work is safe in the bare repo, but a worktree with *uncommitted*
+    changes is refused (``blocked``) rather than silently discarded.
     """
     ctx = _require_ctx(ctx)
     slug = _valid_slug(params.get("slug"))
     observed = _location_of(ctx, slug)
-    if observed is None:
-        return _race("retire", slug, "checkout vanished")
-    dst = ctx.offline_root / slug
-    if dst.exists():
-        return _lay("blocked", f"offline holding spot {slug} already occupied")
+    if observed is None or observed.worktree is None:
+        return _race("retire", slug, "worktree vanished")
+    if observed.dirty:
+        return _lay("blocked", f"{slug!r} has uncommitted changes; refusing to discard its worktree")
     try:
-        _move(observed.location, dst)
-    except FileExistsError:
-        return _race("retire", slug, "offline spot occupied")
-    except OSError as e:
+        GitRepo(observed.bare).worktree_remove(observed.worktree)
+    except GitError as e:
         return _lay("failed", f"retire {slug!r} failed: {e}")
     return _lay("retired", f"retired {slug!r} to offline")
 
 
 @verb("checkout")
 def _checkout(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Check ``commit`` (hex) out at ``slug``'s current location."""
+    """Check ``commit`` (hex) out at ``slug``'s materialized worktree."""
     ctx = _require_ctx(ctx)
     slug = _valid_slug(params.get("slug"))
     commit = _valid_hex_commit(params.get("commit"))
     observed = _location_of(ctx, slug)
-    if observed is None:
-        return _race("checkout", slug, "checkout vanished")
-    repo = GitRepo(observed.location)
+    if observed is None or observed.worktree is None:
+        return _race("checkout", slug, "worktree vanished")
+    repo = GitRepo(observed.worktree)
     if repo.is_dirty():
         return _lay("blocked", f"{slug!r} became dirty between plan and execute")
     try:
@@ -798,33 +850,41 @@ def _checkout(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, A
 # --------------------------------------------------------------------------- #
 # Verbs: a cluster's layout document
 # --------------------------------------------------------------------------- #
-def _layout_path(ctx: HostContext, cluster_slug: str) -> Optional[Path]:
-    observed = _location_of(ctx, cluster_slug)
-    if observed is None:
-        return None
-    return observed.location / "product-cluster" / "default-layout.json"
-
-
 @verb("read_layout")
 def _read_layout(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Read ``<cluster_slug>``'s ``product-cluster/default-layout.json`` contents."""
+    """Read ``<cluster_slug>``'s ``product-cluster/default-layout.json`` contents.
+
+    Bare-aware: when the cluster is materialized, read the file from its worktree;
+    otherwise read the blob committed at the bare repo's ``HEAD``. A missing file (or
+    an absent slug / HEAD) is ``{"exists": False, "layout": None}``.
+    """
     ctx = _require_ctx(ctx)
     cluster_slug = _valid_slug(params.get("cluster_slug"))
-    path = _layout_path(ctx, cluster_slug)
-    if path is None or not path.is_file():
+    observed = _location_of(ctx, cluster_slug)
+    if observed is None:
         return {"exists": False, "layout": None}
-    return {"exists": True, "layout": json.loads(path.read_text())}
+    if observed.worktree is not None:
+        path = observed.worktree / "product-cluster" / "default-layout.json"
+        if not path.is_file():
+            return {"exists": False, "layout": None}
+        return {"exists": True, "layout": json.loads(path.read_text())}
+    try:
+        blob = GitRepo(observed.bare).show_head_blob(_LAYOUT_REL)
+    except GitError:
+        return {"exists": False, "layout": None}
+    return {"exists": True, "layout": json.loads(blob)}
 
 
 @verb("write_layout")
 def _write_layout(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Author ``<cluster_slug>``'s layout document (inside its managed checkout)."""
+    """Author ``<cluster_slug>``'s layout document (requires a materialized worktree)."""
     ctx = _require_ctx(ctx)
     cluster_slug = _valid_slug(params.get("cluster_slug"))
     layout = params.get("layout")
-    path = _layout_path(ctx, cluster_slug)
-    if path is None:
-        raise VerbError(SERVER_ERROR, f"{cluster_slug!r} is not on disk")
+    observed = _location_of(ctx, cluster_slug)
+    if observed is None or observed.worktree is None:
+        raise VerbError(SERVER_ERROR, f"{cluster_slug!r} is not materialized")
+    path = observed.worktree / "product-cluster" / "default-layout.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(layout, indent=2) + "\n")
     return {"ok": True}
@@ -865,18 +925,17 @@ def _ls_remote_symref_hardened(url: str) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Verb: set_remote (add / repoint a remote on a managed checkout)
+# Verb: set_remote (add / repoint a remote on a managed bare repo)
 # --------------------------------------------------------------------------- #
 @verb("set_remote")
 def _set_remote(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
-    """Add or repoint remote ``name`` -> ``url`` on ``slug``'s on-disk checkout.
+    """Add or repoint remote ``name`` -> ``url`` on ``slug``'s bare repo config.
 
-    The fork-adoption flow's effecting half: it relocates the deleted container-side
-    ``GitRepo.set_remote`` onto host git. A LOCAL config edit only — no network, no
-    credential env — but the ``url`` is written into ``.git/config`` and *later*
-    fetched, so it is constrained exactly like ``remote_default_branch``'s: https
-    only, no ``::`` transport helper. ``name`` is held to a bare remote name so it
-    cannot smuggle a path or flag into the config write.
+    The fork-adoption flow's effecting half. A LOCAL config edit only — no network,
+    no credential env — but the ``url`` is written into the bare repo's config and
+    *later* fetched, so it is constrained exactly like ``remote_default_branch``'s:
+    https only, no ``::`` transport helper. ``name`` is held to a bare remote name so
+    it cannot smuggle a path or flag into the config write.
 
     Wire (plain JSON, no request model — match the other verbs):
         ``SetRemoteRequest`` = ``{"slug": str, "name": str, "url": str}``
@@ -889,8 +948,8 @@ def _set_remote(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str,
     observed = _location_of(ctx, slug)
     if observed is None:
         # The container only calls this after observing the repo on disk; re-verify
-        # rather than trust that, so a vanished / never-materialized slug is a clean
+        # rather than trust that, so a vanished / never-created slug is a clean
         # reported failure, not a git error against a guessed path.
         raise VerbError(SERVER_ERROR, f"{slug!r} is not on disk")
-    GitRepo(observed.location).set_remote(name, url)
+    GitRepo(observed.bare).set_remote(name, url)
     return {"ok": True}
