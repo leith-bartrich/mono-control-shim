@@ -123,13 +123,17 @@ class HostContext:
     handed. ``cli._dispatch`` resolves the workspace root, builds one of these,
     and hands it to :class:`BrokerServer`, which threads it to every handler.
 
+    The physical model is bare repos plus git worktrees: ``bare_root`` holds the
+    bare repositories (one per slug, which never move), and ``work_root`` holds the
+    worktrees a repo is materialized into. ``config_dir`` is the manifest dir.
+
     No credential lives here: the git verbs run host git *as the developer*, so
     the host's own git credential machinery (gh helper, Git Credential Manager,
     OS keyring, ``~/.gitconfig``) supplies any token. The broker injects nothing.
     """
 
-    workspace_root: Path
-    offline_root: Path
+    work_root: Path
+    bare_root: Path
     config_dir: Path
 
 

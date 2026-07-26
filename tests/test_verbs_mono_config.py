@@ -20,8 +20,8 @@ class MonoConfigCase(unittest.TestCase):
         self.config = root / "mono-config"
         self.config.mkdir(parents=True)
         self.ctx = HostContext(
-            workspace_root=root / "mono-repos",
-            offline_root=root / "mono-repos-offline",
+            work_root=root / "mono-work",
+            bare_root=root / "mono-repos-bare",
             config_dir=self.config,
         )
 

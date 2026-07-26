@@ -8,6 +8,12 @@ matches what the container expects.
 
     python -m unittest discover -s tests -t .
 
+Physical model: **bare repos + git worktrees**. ``acquire`` creates a bare repo
+under ``bare_root``; ``place`` adds a worktree under ``work_root`` (additive — it
+moves nothing, which is exactly what fixed the old ``WinError 5`` / drvfs move
+bug); ``retire`` removes the worktree while the bare repo (and its commits)
+survive; ``relocate`` is a native ``git worktree move``.
+
 Hermetic and offline: ``acquire`` clones from a *local* bare repo (a path, not a
 network URL), and the ``remote_default_branch`` git mechanics are exercised
 against a local bare repo too — no test reaches the network.
@@ -15,9 +21,7 @@ against a local bare repo too — no test reaches the network.
 
 from __future__ import annotations
 
-import errno
 import json
-import os
 import subprocess
 import tempfile
 import unittest
@@ -27,31 +31,6 @@ from unittest import mock
 from mono_control_shim import broker
 from mono_control_shim.broker import HostContext, VerbError
 from mono_control_shim.verbs import git
-
-
-def _fake_rename(*, exdev_for: Path, eacces_on_publish: bool):
-    """A stand-in for ``os.rename`` that reproduces the drvfs move failure.
-
-    Native NTFS/Linux cannot reproduce the original bug, so the exact errnos are
-    injected: ``EXDEV`` on the initial ``src -> dst`` rename forces ``_move`` down
-    its cross-filesystem copytree+publish branch (as separate 9p/drvfs mounts did
-    in the container), and — when ``eacces_on_publish`` — ``EACCES`` on the atomic
-    publish of ``.<name>.tmp-move -> <name>`` reproduces drvfs's refusal to
-    ``rename()`` a tree containing a read-only file (git packfiles are mode 0444).
-    Every other rename (including the temp->dst publish when not refusing) passes
-    through to the real syscall.
-    """
-    real_rename = os.rename
-
-    def fake_rename(a, b):
-        source = Path(a)
-        if source == exdev_for:
-            raise OSError(errno.EXDEV, "Invalid cross-device link")
-        if eacces_on_publish and source.name.endswith(".tmp-move"):
-            raise OSError(errno.EACCES, "Permission denied")
-        return real_rename(a, b)
-
-    return fake_rename
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -78,21 +57,25 @@ def _commit(repo: Path, name: str, content: str) -> str:
     return _git(["rev-parse", "HEAD"], repo)
 
 
+def _is_bare(path: Path) -> bool:
+    return _git(["-C", str(path), "rev-parse", "--is-bare-repository"], path) == "true"
+
+
 class GitVerbsCase(unittest.TestCase):
-    """A temp workspace / offline / mono-config, plus a local bare origin."""
+    """A temp work root / bare root / mono-config, plus a local bare origin."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)
-        self.workspace = root / "mono-repos"
-        self.offline = root / "mono-repos-offline"
+        self.work = root / "mono-work"
+        self.bare = root / "mono-repos-bare"
         self.config = root / "mono-config"
-        for d in (self.workspace, self.offline, self.config, self.config / "repos"):
+        for d in (self.work, self.bare, self.config, self.config / "repos"):
             d.mkdir(parents=True, exist_ok=True)
         self.ctx = HostContext(
-            workspace_root=self.workspace,
-            offline_root=self.offline,
+            work_root=self.work,
+            bare_root=self.bare,
             config_dir=self.config,
         )
 
@@ -121,35 +104,54 @@ class GitVerbsCase(unittest.TestCase):
     def test_scan_empty_roots(self) -> None:
         self.assertEqual(self._scan(), {"repos": [], "unmanaged": []})
 
-    def test_scan_reports_managed_and_unmanaged_with_relative_locations(self) -> None:
-        # A managed checkout (slug-stamped) placed offline.
+    def test_scan_reports_offline_bare_and_unmanaged(self) -> None:
+        # A managed bare (slug-stamped), no worktree -> offline, located by its slug.
         self._write_repo_def("demo", sources=None)
-        git._acquire({"slug": "demo"}, self.ctx)  # -> init offline/demo (no source)
-        # An unmanaged (unstamped) checkout under the workspace root.
-        foreign = self.workspace / "foreign"
-        foreign.mkdir()
-        _git(["init"], foreign)
+        git._acquire({"slug": "demo"}, self.ctx)  # -> init bare_root/demo (no source)
+        # An unmanaged (unstamped) bare repo sitting under the bare root.
+        _git(["init", "--bare", str(self.bare / "foreign")], self.bare)
 
         result = self._scan()
 
         self.assertEqual(len(result["repos"]), 1)
         repo = result["repos"][0]
         self.assertEqual(repo["slug"], "demo")
-        self.assertEqual(repo["location"], "demo")  # relative to the offline root
+        self.assertEqual(repo["location"], "demo")  # slug (relative to the bare root)
         self.assertEqual(repo["state"], "offline")
-        self.assertEqual(result["unmanaged"], [{"location": "foreign", "state": "materialized"}])
+        self.assertFalse(repo["dirty"])
+        self.assertEqual(result["unmanaged"], [{"location": "foreign", "state": "offline"}])
 
-    # -- acquire ----------------------------------------------------------- #
+    def test_scan_reports_materialized_when_worktree_present(self) -> None:
+        commits = self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "cluster/proj"}, self.ctx)
+
+        repo = self._scan()["repos"][0]
+        self.assertEqual(repo["slug"], "proj")
+        self.assertEqual(repo["location"], "cluster/proj")  # worktree, rel to work root
+        self.assertEqual(repo["state"], "materialized")
+        self.assertEqual(repo["commit"], commits[-1])  # worktree HEAD
+        self.assertFalse(repo["dirty"])
+
+    def test_scan_reports_dirty_worktree(self) -> None:
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "live"}, self.ctx)
+        (self.work / "live" / "a.txt").write_text("dirtied\n")
+        repo = self._scan()["repos"][0]
+        self.assertTrue(repo["dirty"])
+
+    # -- acquire (creates a BARE repo) ------------------------------------- #
     def test_acquire_definition_missing(self) -> None:
         out = git._acquire({"slug": "ghost", "refs": []}, self.ctx)
         self.assertEqual(out["status"], "definition-missing")
 
-    def test_acquire_initializes_sourceless_repo(self) -> None:
+    def test_acquire_initializes_sourceless_bare_repo(self) -> None:
         self._write_repo_def("fresh", sources=None)
         out = git._acquire({"slug": "fresh", "initial_branch": "main"}, self.ctx)
         self.assertEqual(out["status"], "initialized")
-        self.assertTrue((self.offline / "fresh" / ".git").exists())
-        self.assertEqual(git.GitRepo(self.offline / "fresh").slug(), "fresh")
+        # It is a BARE repo (no working tree), stamped with its slug.
+        self.assertTrue(_is_bare(self.bare / "fresh"))
+        self.assertFalse((self.bare / "fresh" / ".git").exists())  # bare: no .git subdir
+        self.assertEqual(git.GitRepo(self.bare / "fresh").slug(), "fresh")
 
     def test_acquire_source_missing_when_refs_requested_without_source(self) -> None:
         self._write_repo_def("fresh", sources=None)
@@ -157,7 +159,7 @@ class GitVerbsCase(unittest.TestCase):
         self.assertEqual(out["status"], "source-missing")
         self.assertEqual(out["unresolved_refs"], ["refs/heads/main"])
 
-    def test_acquire_clones_and_resolves_branch_head(self) -> None:
+    def test_acquire_clones_bare_and_resolves_branch_head(self) -> None:
         bare, commits = self._make_origin()
         self._write_repo_def("proj", sources={"origin": str(bare)})
 
@@ -165,9 +167,9 @@ class GitVerbsCase(unittest.TestCase):
 
         self.assertEqual(out["status"], "cloned")
         self.assertEqual(out["unresolved_refs"], [])
-        # Keyed by the requested ref, resolving via origin's copy of the branch head.
+        # A bare clone keeps branch heads directly under refs/heads/*.
         self.assertEqual(out["resolved"], {"refs/heads/main": commits[-1]})
-        self.assertTrue((self.offline / "proj" / ".git").exists())
+        self.assertTrue(_is_bare(self.bare / "proj"))
 
     def test_acquire_ref_missing_for_unknown_ref(self) -> None:
         bare, _ = self._make_origin()
@@ -179,7 +181,7 @@ class GitVerbsCase(unittest.TestCase):
     def test_acquire_fetches_when_already_present(self) -> None:
         bare, commits = self._make_origin()
         self._write_repo_def("proj", sources={"origin": str(bare)})
-        git._acquire({"slug": "proj", "refs": []}, self.ctx)  # clone
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)  # clone (bare)
         out = git._acquire({"slug": "proj", "refs": ["refs/heads/main"]}, self.ctx)
         self.assertEqual(out["status"], "fetched")
         self.assertEqual(out["resolved"], {"refs/heads/main": commits[-1]})
@@ -191,82 +193,143 @@ class GitVerbsCase(unittest.TestCase):
         git._acquire({"slug": slug, "refs": []}, self.ctx)
         return commits
 
-    def test_place_moves_offline_checkout_into_workspace(self) -> None:
+    def test_place_adds_worktree_and_leaves_bare_unmoved(self) -> None:
         self._acquire_offline("proj")
         out = git._place({"slug": "proj", "location": "cluster/proj"}, self.ctx)
         self.assertEqual(out["status"], "placed")
         self.assertIn("cluster/proj", out["summary"])
-        self.assertTrue((self.workspace / "cluster" / "proj" / ".git").exists())
-        self.assertFalse((self.offline / "proj").exists())
+        # The worktree exists with the tracked files present...
+        wt = self.work / "cluster" / "proj"
+        self.assertTrue((wt / "a.txt").exists())
+        self.assertTrue((wt / "b.txt").exists())
+        # ...and the bare repo never moved (additive worktree add, no dir move).
+        self.assertTrue(_is_bare(self.bare / "proj"))
+        # git records the worktree against the bare repo.
+        listing = _git(["-C", str(self.bare / "proj"), "worktree", "list"], self.bare / "proj")
+        self.assertIn(str(wt.resolve()).replace("\\", "/"), listing.replace("\\", "/"))
         # scan now reports it materialized at the relative location.
         repo = self._scan()["repos"][0]
         self.assertEqual((repo["location"], repo["state"]), ("cluster/proj", "materialized"))
 
     def test_place_onto_occupied_destination_is_race_aborted(self) -> None:
         self._acquire_offline("proj")
-        (self.workspace / "taken").mkdir()
-        (self.workspace / "taken" / "keep").write_text("x")
+        (self.work / "taken").mkdir()
+        (self.work / "taken" / "keep").write_text("x")
         out = git._place({"slug": "proj", "location": "taken"}, self.ctx)
         self.assertEqual(out["status"], "race-aborted")
 
-    def test_place_vanished_checkout_is_race_aborted(self) -> None:
+    def test_place_vanished_repo_is_race_aborted(self) -> None:
         self._write_repo_def("proj", sources=None)  # def exists, nothing on disk
         out = git._place({"slug": "proj", "location": "here"}, self.ctx)
         self.assertEqual(out["status"], "race-aborted")
 
-    def test_relocate_between_materialized_locations(self) -> None:
+    def test_relocate_moves_worktree(self) -> None:
         self._acquire_offline("proj")
         git._place({"slug": "proj", "location": "one"}, self.ctx)
         out = git._relocate({"slug": "proj", "location": "two/proj"}, self.ctx)
         self.assertEqual(out["status"], "relocated")
-        self.assertTrue((self.workspace / "two" / "proj" / ".git").exists())
-        self.assertFalse((self.workspace / "one").exists())
+        self.assertTrue((self.work / "two" / "proj" / "a.txt").exists())
+        self.assertFalse((self.work / "one").exists())
+        # Still one worktree, now at the new location; scan agrees.
+        repo = self._scan()["repos"][0]
+        self.assertEqual((repo["location"], repo["state"]), ("two/proj", "materialized"))
 
-    def test_retire_moves_back_to_offline(self) -> None:
+    def test_retire_removes_worktree_and_bare_survives(self) -> None:
         self._acquire_offline("proj")
         git._place({"slug": "proj", "location": "live"}, self.ctx)
         out = git._retire({"slug": "proj"}, self.ctx)
         self.assertEqual(out["status"], "retired")
-        self.assertTrue((self.offline / "proj" / ".git").exists())
+        self.assertFalse((self.work / "live").exists())  # worktree gone
+        self.assertTrue(_is_bare(self.bare / "proj"))  # bare repo survives
+        # Back to offline in the inventory.
+        repo = self._scan()["repos"][0]
+        self.assertEqual((repo["location"], repo["state"]), ("proj", "offline"))
 
-    def test_retire_blocked_when_offline_spot_occupied(self) -> None:
+    def test_retire_blocked_on_dirty_worktree(self) -> None:
+        # Committed work is safe in the bare repo; an uncommitted worktree is refused.
         self._acquire_offline("proj")
         git._place({"slug": "proj", "location": "live"}, self.ctx)
-        (self.offline / "proj").mkdir()  # spot already taken
+        (self.work / "live" / "a.txt").write_text("uncommitted change\n")
         out = git._retire({"slug": "proj"}, self.ctx)
         self.assertEqual(out["status"], "blocked")
+        self.assertTrue((self.work / "live").exists())  # worktree left in place
+
+    def test_retire_vanished_worktree_is_race_aborted(self) -> None:
+        # Offline (never placed): there is no worktree to retire.
+        self._acquire_offline("proj")
+        out = git._retire({"slug": "proj"}, self.ctx)
+        self.assertEqual(out["status"], "race-aborted")
 
     # -- checkout ---------------------------------------------------------- #
-    def test_checkout_switches_commit(self) -> None:
+    def test_checkout_switches_commit_in_worktree(self) -> None:
         commits = self._acquire_offline("proj")
         git._place({"slug": "proj", "location": "live"}, self.ctx)
         out = git._checkout({"slug": "proj", "commit": commits[0]}, self.ctx)
         self.assertEqual(out["status"], "checked-out")
-        head = git.GitRepo(self.workspace / "live").current_commit()
+        head = git.GitRepo(self.work / "live").current_commit()
         self.assertEqual(head, commits[0])
 
     def test_checkout_blocked_when_dirty(self) -> None:
         commits = self._acquire_offline("proj")
         git._place({"slug": "proj", "location": "live"}, self.ctx)
-        (self.workspace / "live" / "a.txt").write_text("dirtied\n")
+        (self.work / "live" / "a.txt").write_text("dirtied\n")
         out = git._checkout({"slug": "proj", "commit": commits[0]}, self.ctx)
         self.assertEqual(out["status"], "blocked")
 
     # -- read_layout / write_layout ---------------------------------------- #
-    def test_write_then_read_layout(self) -> None:
+    def test_write_then_read_layout_from_worktree(self) -> None:
         self._acquire_offline("cl")
         git._place({"slug": "cl", "location": "cl"}, self.ctx)
         payload = {"members": ["a", "b"]}
-        self.assertEqual(git._write_layout({"cluster_slug": "cl", "layout": payload}, self.ctx), {"ok": True})
+        self.assertEqual(
+            git._write_layout({"cluster_slug": "cl", "layout": payload}, self.ctx),
+            {"ok": True},
+        )
         out = git._read_layout({"cluster_slug": "cl"}, self.ctx)
         self.assertEqual(out, {"exists": True, "layout": payload})
 
     def test_read_layout_absent_is_exists_false(self) -> None:
         self._acquire_offline("cl")
         git._place({"slug": "cl", "location": "cl"}, self.ctx)
-        self.assertEqual(git._read_layout({"cluster_slug": "cl"}, self.ctx), {"exists": False, "layout": None})
+        self.assertEqual(
+            git._read_layout({"cluster_slug": "cl"}, self.ctx),
+            {"exists": False, "layout": None},
+        )
 
-    def test_write_layout_not_on_disk_is_server_error(self) -> None:
+    def test_read_layout_reads_committed_blob_from_bare_when_offline(self) -> None:
+        # A cluster repo whose origin already COMMITTED a layout doc; clone it bare
+        # and, without placing a worktree, read the layout out of the bare HEAD.
+        work = Path(self._tmp.name) / "cl-src"
+        (work / "product-cluster").mkdir(parents=True)
+        _git(["init", "-b", "main"], work)
+        payload = {"members": ["x", "y"]}
+        (work / "product-cluster" / "default-layout.json").write_text(json.dumps(payload))
+        _git(["add", "."], work)
+        _git(["commit", "-m", "layout"], work)
+        bare = Path(self._tmp.name) / "cl.git"
+        _git(["clone", "--bare", str(work), str(bare)], Path(self._tmp.name))
+        self._write_repo_def("cl", sources={"origin": str(bare)})
+        git._acquire({"slug": "cl", "refs": []}, self.ctx)  # bare clone, NOT placed
+
+        obs = git._location_of(self.ctx, "cl")
+        self.assertEqual(obs.state, "offline")  # no worktree
+        out = git._read_layout({"cluster_slug": "cl"}, self.ctx)
+        self.assertEqual(out, {"exists": True, "layout": payload})
+
+    def test_read_layout_missing_slug_is_exists_false(self) -> None:
+        self.assertEqual(
+            git._read_layout({"cluster_slug": "nope"}, self.ctx),
+            {"exists": False, "layout": None},
+        )
+
+    def test_write_layout_not_materialized_is_server_error(self) -> None:
+        # Offline (bare, no worktree): writing requires a materialized worktree.
+        self._acquire_offline("cl")
+        with self.assertRaises(VerbError) as cm:
+            git._write_layout({"cluster_slug": "cl", "layout": {}}, self.ctx)
+        self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
+
+    def test_write_layout_missing_slug_is_server_error(self) -> None:
         with self.assertRaises(VerbError) as cm:
             git._write_layout({"cluster_slug": "nope", "layout": {}}, self.ctx)
         self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
@@ -280,10 +343,10 @@ class GitVerbsCase(unittest.TestCase):
 
 
 class SetRemote(GitVerbsCase):
-    """``set_remote`` adds or repoints a remote on a managed checkout (local, no net)."""
+    """``set_remote`` adds or repoints a remote on the managed bare repo (local, no net)."""
 
-    def _remote_url(self, checkout: Path, name: str) -> str:
-        return _git(["remote", "get-url", name], checkout)
+    def _remote_url(self, repo_dir: Path, name: str) -> str:
+        return _git(["-C", str(repo_dir), "remote", "get-url", name], repo_dir)
 
     def test_set_remote_adds_when_absent(self) -> None:
         self._acquire_offline("proj")
@@ -292,12 +355,12 @@ class SetRemote(GitVerbsCase):
             git._set_remote({"slug": "proj", "name": "upstream", "url": url}, self.ctx),
             {"ok": True},
         )
-        self.assertEqual(self._remote_url(self.offline / "proj", "upstream"), url)
+        self.assertEqual(self._remote_url(self.bare / "proj", "upstream"), url)
 
     def test_set_remote_repoints_existing(self) -> None:
         self._acquire_offline("proj")
-        checkout = self.offline / "proj"
-        _git(["remote", "add", "origin2", "https://github.com/o/old.git"], checkout)
+        repo_dir = self.bare / "proj"
+        _git(["-C", str(repo_dir), "remote", "add", "origin2", "https://github.com/o/old.git"], repo_dir)
         new_url = "https://github.com/o/new.git"
         self.assertEqual(
             git._set_remote(
@@ -305,14 +368,14 @@ class SetRemote(GitVerbsCase):
             ),
             {"ok": True},
         )
-        self.assertEqual(self._remote_url(checkout, "origin2"), new_url)
+        self.assertEqual(self._remote_url(repo_dir, "origin2"), new_url)
 
     def test_set_remote_repoints_repo_default_origin(self) -> None:
         # ``acquire`` clones, so ``origin`` already exists — repoint it in place.
         self._acquire_offline("proj")
         new_url = "https://github.com/o/moved.git"
         git._set_remote({"slug": "proj", "name": "origin", "url": new_url}, self.ctx)
-        self.assertEqual(self._remote_url(self.offline / "proj", "origin"), new_url)
+        self.assertEqual(self._remote_url(self.bare / "proj", "origin"), new_url)
 
     def test_set_remote_not_on_disk_is_server_error(self) -> None:
         self._write_repo_def("ghost", sources=None)  # def exists, nothing on disk
@@ -397,6 +460,33 @@ class ContextRequired(GitVerbsCase):
         with self.assertRaises(VerbError) as cm:
             git._scan({}, None)
         self.assertEqual(cm.exception.code, broker.SERVER_ERROR)
+
+
+class WorktreePlacementIsAdditive(GitVerbsCase):
+    """Placement moves nothing held.
+
+    This is the whole reason the physical model changed. The old model MOVED a
+    directory (``mono-repos-offline/<slug>`` -> ``mono-repos/<loc>``) with
+    ``os.rename``; on Windows an IDE holding those dirs made the move fail with
+    ``WinError 5`` (and under drvfs, ``EACCES`` publishing a tree with read-only
+    packfiles). ``place`` is now a ``git worktree add``: the bare repo stays put and
+    a fresh worktree is written alongside it, so the class of held-directory move
+    failure is gone by construction. There is nothing left to regression-test about
+    a move — this case documents its removal and asserts the bare repo is untouched.
+    """
+
+    def test_place_leaves_the_bare_repo_in_place(self) -> None:
+        self._acquire_offline("proj")
+        bare_dir = self.bare / "proj"
+        before = {p.name for p in bare_dir.iterdir()}
+        git._place({"slug": "proj", "location": "cluster/proj"}, self.ctx)
+        after = {p.name for p in bare_dir.iterdir()}
+        # The bare repo is still a bare repo at the same path (nothing moved); the add
+        # only *grows* it with worktree bookkeeping (a ``worktrees/`` dir), never
+        # removes or relocates the object store.
+        self.assertTrue(_is_bare(bare_dir))
+        self.assertTrue(before <= after)  # existing entries all survive
+        self.assertIn("objects", after)  # the object store is still right here
 
 
 class NonInteractivePosture(GitVerbsCase):
@@ -493,7 +583,7 @@ class AuthFailureSummary(GitVerbsCase):
         self._assert_actionable(out["summary"])
 
     def test_fetch_auth_failure_returns_the_setup_hint(self) -> None:
-        # A real offline checkout first, then auth failure on the fetch only.
+        # A real offline bare repo first, then auth failure on the fetch only.
         self._acquire_offline("proj")
         real_run_git = git.run_git
 
@@ -537,102 +627,6 @@ class AuthFailureSummary(GitVerbsCase):
         self.assertEqual(out["status"], "create-failed")
         self.assertNotIn("gh auth login", out["summary"])
         self.assertIn("could not resolve host", out["summary"])
-
-
-class MoveDrvfsRegression(GitVerbsCase):
-    """Regression for the drvfs ``EACCES``-on-move bug that started this project.
-
-    On a Windows host, ``mono-repos/`` and ``mono-repos-offline/`` were bind-mounted
-    into the container over 9p/drvfs. drvfs refuses to ``rename()`` a directory tree
-    that contains a read-only file (git packfiles are mode 0444), so the layout
-    engine's cross-device move failed with ``[Errno 13] EACCES`` when publishing
-    ``.<name>.tmp-move -> <name>``. Re-hosting the move onto the host's own
-    filesystem (this pack's ``_move``) fixes it by construction, but nothing in the
-    suite reproduced the failure mode — so it shipped and bit.
-
-    Native NTFS/Linux won't reproduce it, so these tests model it by monkeypatching
-    ``os.rename`` (via ``git.os``, exactly as the deleted container test
-    ``mono-control/tests/test_layout_move.py`` monkeypatched ``execute.os.rename``)
-    to raise the exact original errnos. The key assertion is that the ``place`` verb
-    turns the refusal into a structured ``{"status": "failed", ...}`` outcome, never
-    an unhandled traceback across the wire.
-    """
-
-    def test_place_surfaces_drvfs_publish_eacces_as_a_failed_outcome(self) -> None:
-        # A real acquired offline checkout (with the read-only git objects that make
-        # drvfs refuse the rename in the first place).
-        self._acquire_offline("proj")
-        src = self.offline / "proj"
-
-        # EXDEV forces the copytree+publish branch; EACCES on the publish is the
-        # exact original failure.
-        patched = _fake_rename(exdev_for=src, eacces_on_publish=True)
-        with mock.patch.object(git.os, "rename", patched):
-            out = git._place({"slug": "proj", "location": "cluster/proj"}, self.ctx)
-
-        # A structured failure, not a crash: a dict outcome with a clear summary.
-        self.assertEqual(out["status"], "failed")
-        self.assertIn("place", out["summary"])
-        self.assertIn("proj", out["summary"])
-        self.assertIn("Permission denied", out["summary"])
-        # The publish never completed: source intact, destination never created.
-        self.assertTrue((self.offline / "proj" / ".git").exists())
-        self.assertFalse((self.workspace / "cluster" / "proj").exists())
-
-    def test_move_publish_rename_eacces_propagates_as_oserror(self) -> None:
-        # ``_move`` directly: it must surface the publish refusal as the OSError
-        # family the verbs catch — not swallow it, not leave a half-published dst.
-        src = Path(self._tmp.name) / "src"
-        (src / "sub").mkdir(parents=True)
-        (src / "f.txt").write_text("hi\n")
-        (src / "sub" / "g.txt").write_text("nested\n")
-        dst = self.workspace / "landed"
-
-        patched = _fake_rename(exdev_for=src, eacces_on_publish=True)
-        with mock.patch.object(git.os, "rename", patched):
-            with self.assertRaises(OSError) as cm:
-                git._move(src, dst)
-
-        self.assertEqual(cm.exception.errno, errno.EACCES)
-        self.assertFalse(dst.exists())  # publish never happened
-        self.assertTrue((src / "f.txt").exists())  # source left intact
-
-    def test_move_copy_branch_carries_a_readonly_file(self) -> None:
-        # The native-host behavior the fix relies on: drvfs refused to *rename* a
-        # tree containing a read-only file, but ``copytree(symlinks=True)`` copies
-        # read-only files fine, so the copy+publish branch succeeds where the OS
-        # permits it.
-        src = Path(self._tmp.name) / "ro-src"
-        (src / "sub").mkdir(parents=True)
-        (src / "sub" / "g.txt").write_text("nested\n")
-        packish = src / "pack.idx"  # a git-packfile-like read-only file (mode 0444)
-        packish.write_text("packdata\n")
-        os.chmod(packish, 0o444)
-        dst = self.workspace / "landed"
-
-        # EXDEV only: force the copy branch, then let the temp->dst publish through.
-        patched = _fake_rename(exdev_for=src, eacces_on_publish=False)
-        moved = True
-        with mock.patch.object(git.os, "rename", patched):
-            try:
-                git._move(src, dst)
-            except OSError as e:
-                # Windows refuses to unlink the read-only file during ``_move``'s
-                # final ``rmtree(src)`` cleanup (a platform quirk unrelated to the
-                # copy, which already published ``dst``); POSIX hosts remove it fine.
-                if not (os.name == "nt" and e.errno == errno.EACCES):
-                    raise
-                moved = False
-
-        # Load-bearing: copytree replicated the read-only file and the publish put
-        # it in place, mode preserved (symlinks=True), temp dir consumed.
-        landed = dst / "pack.idx"
-        self.assertEqual(landed.read_text(), "packdata\n")
-        self.assertFalse(os.access(landed, os.W_OK))  # still read-only
-        self.assertEqual((dst / "sub" / "g.txt").read_text(), "nested\n")
-        self.assertFalse((dst.parent / f".{dst.name}.tmp-move").exists())
-        if moved:  # POSIX: the whole move completed and the source is gone
-            self.assertFalse(src.exists())
 
 
 if __name__ == "__main__":
