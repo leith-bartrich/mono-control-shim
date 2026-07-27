@@ -208,6 +208,34 @@ def _noninteractive_config() -> list[str]:
     return list(_NONINTERACTIVE_CONFIG)
 
 
+# Identity for the root commit ``init`` writes, used only for fields the host has not
+# configured. The address is deliberately unroutable (RFC 2606 ``.invalid``): a
+# machine-made commit should not look like it came from a real mailbox.
+_FALLBACK_IDENTITY = (
+    ("user.name", "mono-control"),
+    ("user.email", "mono-control@invalid"),
+)
+
+
+def _identity_config(repo: "GitRepo") -> list[str]:
+    """``-c user.*`` pairs for identity fields the host hasn't set.
+
+    The user's own identity is preferred, so a commit made on their behalf looks like
+    the rest of their history. The fallback applies per field, and only when a field
+    is missing, so ``repo init`` still works on a fresh machine with no git identity
+    configured rather than failing at the last step.
+    """
+    config: list[str] = []
+    for key, fallback in _FALLBACK_IDENTITY:
+        try:
+            if repo.config_get(key):
+                continue
+        except GitError:
+            pass  # unset: `config --get` exits non-zero on a missing key
+        config += ["-c", f"{key}={fallback}"]
+    return config
+
+
 def _noninteractive_env(*, https_only: bool = False) -> dict[str, str]:
     """The environment for a network git call: strictly non-interactive, no token.
 
@@ -261,6 +289,34 @@ class GitRepo:
 
     def config_get(self, key: str) -> str:
         return self._git("config", "--get", key)
+
+    def head_branch(self) -> str:
+        """The branch HEAD names — meaningful even while that branch is *unborn*."""
+        return self._git("symbolic-ref", "--short", "HEAD")
+
+    def write_root_commit(self, message: str = "initial commit") -> str:
+        """Give an empty repo an empty root commit, so HEAD resolves to something.
+
+        ``git init --bare`` leaves HEAD pointing at an **unborn** branch. That is a
+        valid repo, but ``git worktree add <path> HEAD`` cannot resolve it
+        (``fatal: invalid reference: HEAD``), so a brand-new repo could be created and
+        then never placed — ``repo init`` followed by ``mat moveto`` failed at the last
+        step. Writing a root commit here makes the repo placeable from the moment it
+        exists, and costs one commit carrying no content.
+
+        Done with plumbing (``hash-object`` / ``commit-tree`` / ``update-ref``) rather
+        than ``git worktree add --orphan`` because that flag needs git >= 2.42, and the
+        in-container fake this file is mirrored by runs against an older git.
+        """
+        branch = self.head_branch()
+        tree = self._git("hash-object", "-w", "-t", "tree", os.devnull)
+        commit = run_git(
+            ["commit-tree", tree, "-m", message],
+            cwd=self.path,
+            config=_identity_config(self),
+        )
+        self._git("update-ref", f"refs/heads/{branch}", commit)
+        return commit
 
     def slug(self) -> str:
         try:
@@ -395,7 +451,12 @@ def init(
     slug: str,
     initial_branch: Optional[str] = None,
 ) -> GitRepo:
-    """Initialize a new empty **bare** repo at ``path`` and stamp ``profile`` + ``slug``."""
+    """Initialize a new **bare** repo at ``path`` and stamp ``profile`` + ``slug``.
+
+    The repo is given an empty root commit (see
+    :meth:`GitRepo.write_root_commit`) so it is placeable immediately: a repo whose
+    HEAD is still unborn cannot have a worktree added off it.
+    """
     path = Path(path)
     args = ["init", "--bare"]
     if initial_branch is not None:
@@ -405,6 +466,7 @@ def init(
     repo = GitRepo(path)
     repo._apply_profile(profile)
     repo._apply_slug(slug)
+    repo.write_root_commit()
     return repo
 
 

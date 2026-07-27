@@ -153,6 +153,43 @@ class GitVerbsCase(unittest.TestCase):
         self.assertFalse((self.bare / "fresh" / ".git").exists())  # bare: no .git subdir
         self.assertEqual(git.GitRepo(self.bare / "fresh").slug(), "fresh")
 
+    def test_sourceless_init_is_placeable(self) -> None:
+        """A brand-new repo must be placeable, not merely creatable.
+
+        ``git init --bare`` leaves HEAD on an *unborn* branch, which
+        ``git worktree add <path> HEAD`` cannot resolve — so ``repo init`` followed by
+        ``mat moveto`` failed with ``fatal: invalid reference: HEAD``, leaving a repo
+        that could be created and never used. ``init`` now writes an empty root commit
+        on the branch HEAD names.
+        """
+        self._write_repo_def("fresh", sources=None)
+        git._acquire({"slug": "fresh", "initial_branch": "main"}, self.ctx)
+
+        repo = git.GitRepo(self.bare / "fresh")
+        self.assertEqual(repo.head_branch(), "main")
+        self.assertIsNotNone(repo.resolve_ref("HEAD"))
+
+        out = git._place({"slug": "fresh", "location": "fresh"}, self.ctx)
+        self.assertEqual(out["status"], "placed")
+        self.assertTrue((self.work / "fresh").is_dir())
+        self.assertEqual(git.GitRepo(self.work / "fresh").slug(), "fresh")
+
+    def test_root_commit_falls_back_to_tool_identity(self) -> None:
+        """``repo init`` must still work on a host with no git identity configured."""
+        self._write_repo_def("fresh", sources=None)
+        real_config_get = git.GitRepo.config_get
+
+        def only_identity_unset(self: git.GitRepo, key: str) -> str:
+            # Just user.name / user.email — the slug stamp still has to round-trip.
+            if key.startswith("user."):
+                raise git.GitError(f"`git config --get {key}` failed: ")
+            return real_config_get(self, key)
+
+        with mock.patch.object(git.GitRepo, "config_get", only_identity_unset):
+            git._acquire({"slug": "fresh", "initial_branch": "main"}, self.ctx)
+        author = git.GitRepo(self.bare / "fresh")._git("log", "-1", "--format=%an <%ae>")
+        self.assertEqual(author, "mono-control <mono-control@invalid>")
+
     def test_acquire_source_missing_when_refs_requested_without_source(self) -> None:
         self._write_repo_def("fresh", sources=None)
         out = git._acquire({"slug": "fresh", "refs": ["refs/heads/main"]}, self.ctx)
