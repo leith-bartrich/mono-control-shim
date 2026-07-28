@@ -71,6 +71,22 @@ _SLUG_KEY = "mono-control.slug"
 # committed tree read out of the bare repo's HEAD).
 _LAYOUT_REL = "product-cluster/default-layout.json"
 
+# The governed source names, mirroring mono-control's ``config/source_names.py`` (the
+# container owns the vocabulary; the host needs it to map sources onto git remotes).
+# ``origin`` and ``upstream`` are mutually exclusive canonicals; ``fork-ours`` is our
+# writable copy of an upstream.
+ORIGIN = "origin"
+UPSTREAM = "upstream"
+FORK_OURS = "fork-ours"
+
+# What every conformed remote fetches. Remote-tracking, deliberately **not** mirror
+# (``+refs/heads/*:refs/heads/*``): a mirror refspec force-overwrites local branches —
+# destroying work the moment anyone commits on one — and collapses under multiple
+# remotes, since `upstream` and `fork-ours` would both map onto ``refs/heads/*`` and the
+# last fetch would win. ``clone --bare`` sets no refspec at all, which is why a fetch
+# currently updates nothing.
+_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/{name}/*"
+
 # FS-capability config stamped at create time, in (git config key, attr) form —
 # so every later git on the repo (ours or a developer's) behaves consistently.
 _PROFILE_KEYS = (
@@ -364,6 +380,35 @@ class GitRepo:
         # ``--`` guards against a ref that begins with ``-`` being read as a flag;
         # the caller has already checked it is bare hex, this is defense in depth.
         self._git("checkout", ref, "--")
+
+    def remotes(self) -> list[str]:
+        """The configured remote names."""
+        return self._git("remote").split()
+
+    def remote_url(self, name: str) -> Optional[str]:
+        try:
+            return self._git("remote", "get-url", name)
+        except GitError:
+            return None
+
+    def remove_remote(self, name: str) -> None:
+        """Drop a remote **and its remote-tracking refs**.
+
+        Repointing is remove-then-add rather than ``set-url`` precisely for this: a
+        ``set-url`` leaves ``refs/remotes/<name>/*`` describing the *old* remote, so the
+        two would coexist under one name and both look current. No work is at risk —
+        ``refs/heads/*`` is untouched and tracking refs are regenerable mirrored state.
+        """
+        self._git("remote", "remove", name)
+
+    def set_fetch_refspec(self, name: str) -> None:
+        """Give ``name`` the standard remote-tracking refspec (idempotent).
+
+        ``git remote add`` sets this itself, but the ``origin`` created by
+        ``clone --bare`` has a URL and no refspec — which is why fetching a bare repo
+        updates nothing.
+        """
+        self._git("config", f"remote.{name}.fetch", _FETCH_REFSPEC.format(name=name))
 
     def set_remote(self, name: str, url: str) -> None:
         """Point remote ``name`` at ``url``: add it, or repoint it if it exists.
@@ -732,11 +777,84 @@ def _repo_def_path(ctx: HostContext, slug: str) -> Path:
     return ctx.config_dir / "repos" / f"{slug}.json"
 
 
-def _source_url(ctx: HostContext, slug: str) -> Optional[str]:
-    """The first declared source URL from the host repo def (never the container's)."""
+def _sources(ctx: HostContext, slug: str) -> dict[str, str]:
+    """The declared ``name -> url`` sources from the host repo def.
+
+    Read off the host's own disk, never accepted from the container — which is why
+    these URLs skip ``_sanitize_remote_url`` (that guards *container-supplied* URLs).
+    """
     data = json.loads(_repo_def_path(ctx, slug).read_text())
-    sources = data.get("sources") or {}
-    return next(iter(sources.values())) if sources else None
+    return dict(data.get("sources") or {})
+
+
+def _default_source(sources: dict[str, str]) -> Optional[str]:
+    """The source name git's ``origin`` should alias, or ``None`` for a source-less repo.
+
+    The remote you would reach for by default: **our writable canonical** where one
+    exists (``origin`` if the repo is ours, else ``fork-ours``), otherwise the **read
+    canonical** (``upstream``). Mirrors and third-party forks are tracked references and
+    are never the default — see ``docs/design/layers/data/repo.md``.
+    """
+    for name in (ORIGIN, FORK_OURS, UPSTREAM):
+        if sources.get(name):
+            return name
+    # No governed canonical: fall back to first-declared so an oddly-named source still
+    # gets a usable default rather than leaving the repo with no `origin` at all.
+    return next(iter(sources), None)
+
+
+def _fetch_origin(repo: GitRepo, slug: str) -> Optional[dict[str, Any]]:
+    """Fetch ``origin``; return a ``fetch-failed`` envelope on error, else ``None``.
+
+    ``origin`` is conformed before this runs, so a failure here is a real one (network,
+    auth, a bad URL) rather than the remote simply not existing — which is why there is
+    no longer a fallback to fetching the URL anonymously. That fallback could not have
+    helped anyway: an anonymous fetch lands in ``FETCH_HEAD`` and updates no refs.
+    """
+    try:
+        repo.fetch(ORIGIN)
+    except GitError as e:
+        if is_auth_failure(str(e)):
+            return _src("fetch-failed", _auth_summary(slug))
+        return _src("fetch-failed", f"fetch {slug!r} failed: {e}")
+    return None
+
+
+def conform_remotes(repo: GitRepo, sources: dict[str, str]) -> list[str]:
+    """Bring ``repo``'s git remotes into agreement with the declared sources.
+
+    Two rules, both pure functions of the repo def:
+
+    1. **Every declared source is a git remote under its governed name**, so
+       ``git fetch <name>`` can be trusted.
+    2. **``origin`` always exists and aliases the default source** (see
+       :func:`_default_source`). The worktrees are worked in with *plain git*, which
+       mono-control deliberately does not wrap — a checkout where ``git pull`` has no
+       default is not usable by the tool the developer is actually holding.
+
+    An upstream-based repo therefore carries both ``origin`` and ``fork-ours`` at the
+    same URL. That duplication is intended: rule 1 holding *universally* is worth more
+    than a tidy ``git remote -v``.
+
+    **Additive** — remotes we do not recognise are left alone and returned, matching how
+    ``scan`` reports unmanaged repos rather than deleting them. Idempotent: re-running
+    changes nothing.
+    """
+    desired = dict(sources)
+    default = _default_source(sources)
+    if default is not None:
+        desired[ORIGIN] = sources[default]
+
+    existing = set(repo.remotes())
+    for name, url in desired.items():
+        if name in existing and repo.remote_url(name) != url:
+            # Repoint: drop the stale tracking refs with the old remote.
+            repo.remove_remote(name)
+            existing.discard(name)
+        if name not in existing:
+            repo.set_remote(name, url)
+        repo.set_fetch_refspec(name)
+    return sorted(existing - set(desired))
 
 
 def _resolve_ref(repo: GitRepo, ref: str) -> Optional[str]:
@@ -771,9 +889,16 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
     """Make ``refs`` locally resolvable for ``slug``: clone / init / fetch + verify.
 
     Owns the clone-vs-init-vs-fetch decision. The repo is a **bare** repo at
-    ``bare_root/<slug>``; there is no worktree yet (``place`` adds one later). The
-    source URL is resolved from the host repo def only — a URL is never accepted from
-    the container here.
+    ``bare_root/<slug>``; there is no worktree yet (``place`` adds one later). Sources
+    are resolved from the host repo def only — a URL is never accepted from the
+    container here.
+
+    Also **conforms the repo's git remotes** to those sources (see
+    :func:`conform_remotes`) on both the create and already-present paths, so it is
+    idempotent and self-healing: a def edited since the last run is picked up on the
+    next operation. That is what makes fetching ``origin`` below meaningful rather than
+    a guess, and — because ``clone --bare`` sets no fetch refspec — what makes a fetch
+    update refs at all.
     """
     ctx = _require_ctx(ctx)
     slug = _valid_slug(params.get("slug"))
@@ -784,7 +909,9 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
     if not _repo_def_path(ctx, slug).is_file():
         return _src("definition-missing", f"repo def for {slug!r} not found")
 
-    source_url = _source_url(ctx, slug)
+    sources = _sources(ctx, slug)
+    default = _default_source(sources)
+    source_url = sources.get(default) if default is not None else None
     observed = _location_of(ctx, slug)
 
     if observed is None:
@@ -812,20 +939,23 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
             if is_auth_failure(str(e)):
                 return _src("create-failed", _auth_summary(slug))
             return _src("create-failed", f"clone {slug!r} failed: {e}")
+        conform_remotes(repo, sources)
+        # Populate remote-tracking refs, which `clone --bare` does not create. Nearly
+        # free (the objects just arrived) and it means an acquired repo has the same ref
+        # layout however it got here, rather than gaining `refs/remotes/*` only on a
+        # later re-acquire.
+        failed = _fetch_origin(repo, slug)
+        if failed is not None:
+            return failed
         return _verify_refs(repo, refs, "cloned", f"cloned {slug!r}", slug)
 
-    # Present locally (offline or materialized) -> fetch on the bare repo.
+    # Present locally (offline or materialized) -> conform remotes, then fetch.
     repo = GitRepo(observed.bare)
+    conform_remotes(repo, sources)
     if source_url is not None:
-        try:
-            repo.fetch("origin")
-        except GitError:
-            try:
-                repo.fetch(source_url)
-            except GitError as e:
-                if is_auth_failure(str(e)):
-                    return _src("fetch-failed", _auth_summary(slug))
-                return _src("fetch-failed", f"fetch {slug!r} failed: {e}")
+        failed = _fetch_origin(repo, slug)
+        if failed is not None:
+            return failed
     if source_url is None and not refs:
         return _src("ok", f"{slug!r} present, no source to fetch")
     return _verify_refs(repo, refs, "fetched", f"fetched {slug!r}", slug)
