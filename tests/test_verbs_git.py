@@ -291,6 +291,52 @@ class GitVerbsCase(unittest.TestCase):
         self.assertEqual(out["status"], "blocked")
         self.assertTrue((self.work / "live").exists())  # worktree left in place
 
+    def test_retire_blocked_when_a_commit_is_on_no_ref(self) -> None:
+        """Committing on a detached worktree must not be a way to lose work.
+
+        `place` checks out a detached HEAD, so a commit made in a placed worktree sits
+        on no branch. That leaves the tree *clean*, so the dirty gate sees nothing and
+        `git worktree remove` would leave the commit unreachable.
+        """
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "live"}, self.ctx)
+        wt = self.work / "live"
+        (wt / "a.txt").write_text("committed but on no branch\n")
+        _git(["add", "."], wt)
+        _git(["commit", "-m", "orphan-to-be"], wt)
+        self.assertEqual(_git(["status", "--porcelain"], wt), "")  # clean
+
+        out = git._retire({"slug": "proj"}, self.ctx)
+
+        self.assertEqual(out["status"], "blocked")
+        self.assertIn("unreachable", out["summary"])
+        self.assertTrue(wt.exists())
+
+    def test_retire_allowed_once_the_commit_is_anchored(self) -> None:
+        """A branch *or* a tag releases the guard — the question is anchoring, not shape."""
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "live"}, self.ctx)
+        wt = self.work / "live"
+        (wt / "a.txt").write_text("saved\n")
+        _git(["add", "."], wt)
+        _git(["commit", "-m", "keep me"], wt)
+        kept = _git(["rev-parse", "HEAD"], wt)
+        _git(["tag", "keepme"], wt)
+
+        out = git._retire({"slug": "proj"}, self.ctx)
+
+        self.assertEqual(out["status"], "retired")
+        self.assertFalse(wt.exists())
+        # Survives in the bare repo, anchored by the tag.
+        self.assertEqual(_git(["rev-parse", "keepme^{commit}"], self.bare / "proj"), kept)
+
+    def test_retire_allows_a_clean_detached_worktree(self) -> None:
+        """The guard is about *unanchored commits*, not about being detached."""
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "live"}, self.ctx)
+        out = git._retire({"slug": "proj"}, self.ctx)
+        self.assertEqual(out["status"], "retired")
+
     def test_retire_vanished_worktree_is_race_aborted(self) -> None:
         # Offline (never placed): there is no worktree to retire.
         self._acquire_offline("proj")
