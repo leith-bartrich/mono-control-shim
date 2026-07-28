@@ -329,6 +329,26 @@ class GitRepo:
     def is_dirty(self) -> bool:
         return bool(self._git("status", "--porcelain"))
 
+    def unreachable_commit_count(self) -> int:
+        """Commits reachable from *this worktree's* HEAD but from no branch, tag or remote.
+
+        Non-zero means removing the worktree would **orphan** committed work. A detached
+        HEAD's commits are anchored only by that worktree's own HEAD, so
+        ``git worktree remove`` leaves them dangling — and the dirty gate cannot see it,
+        because committing is exactly what makes the tree clean.
+
+        ``--all`` is unusable here: it counts HEAD itself, so the answer would always be
+        zero. Naming the ref namespaces explicitly is what makes the question meaningful,
+        and it means putting the work on a branch *or* tagging it both clear the block.
+        """
+        try:
+            out = self._git(
+                "rev-list", "--count", "HEAD", "--not", "--branches", "--tags", "--remotes"
+            )
+        except GitError:
+            return 0  # unborn HEAD: nothing committed here, nothing to orphan
+        return int(out or 0)
+
     def fetch(self, remote: str, refs: Optional[Iterable[str]] = None) -> None:
         args = ["fetch", remote]
         if refs is not None:
@@ -872,9 +892,15 @@ def _relocate(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, A
 def _retire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
     """Remove ``slug``'s worktree; the bare repo (and its commits) survive.
 
-    ``location`` is ignored — the worktree is derived from the slug. Dirty-gated:
-    committed work is safe in the bare repo, but a worktree with *uncommitted*
-    changes is refused (``blocked``) rather than silently discarded.
+    ``location`` is ignored — the worktree is derived from the slug. Two guards, and
+    they cover opposite halves of the same promise ("retire never loses work"):
+
+    - **uncommitted** changes are refused rather than silently discarded;
+    - **committed** work that no ref anchors is refused too. Committed work is only
+      safe in the bare repo if something points at it, and a detached HEAD's commits
+      are held by the worktree alone — so removing it would leave them dangling. The
+      dirty check cannot catch this, because committing is precisely what cleans the
+      tree.
     """
     ctx = _require_ctx(ctx)
     slug = _valid_slug(params.get("slug"))
@@ -883,6 +909,13 @@ def _retire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any
         return _race("retire", slug, "worktree vanished")
     if observed.dirty:
         return _lay("blocked", f"{slug!r} has uncommitted changes; refusing to discard its worktree")
+    orphans = GitRepo(observed.worktree).unreachable_commit_count()
+    if orphans:
+        return _lay(
+            "blocked",
+            f"{slug!r} has {orphans} commit(s) on no branch, tag or remote — removing its "
+            f"worktree would leave them unreachable; put them on a branch or tag them first",
+        )
     try:
         GitRepo(observed.bare).worktree_remove(observed.worktree)
     except GitError as e:
