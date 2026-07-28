@@ -714,3 +714,130 @@ class AuthFailureSummary(GitVerbsCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteConformance(GitVerbsCase):
+    """Declared sources become git remotes, and `origin` always aliases the default.
+
+    The worktrees are worked in with *plain git*, which mono-control deliberately does
+    not wrap — so a checkout where `git pull` has no default is not usable by the tool
+    the developer is actually holding. `origin` is therefore owned and conformed rather
+    than suppressed.
+    """
+
+    def _remotes(self, slug: str) -> dict[str, str]:
+        repo_dir = self.bare / slug
+        names = _git(["-C", str(repo_dir), "remote"], repo_dir).split()
+        return {n: _git(["-C", str(repo_dir), "remote", "get-url", n], repo_dir) for n in names}
+
+    def _refspec(self, slug: str, name: str) -> str:
+        repo_dir = self.bare / slug
+        return _git(["-C", str(repo_dir), "config", f"remote.{name}.fetch"], repo_dir)
+
+    def test_ours_maps_origin_to_origin(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        self.assertEqual(self._remotes("proj"), {"origin": str(bare)})
+
+    def test_upstream_only_still_gets_an_origin(self) -> None:
+        """A consumed repo has no writable canonical, so `origin` aliases the base."""
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"upstream": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        self.assertEqual(
+            self._remotes("proj"), {"origin": str(bare), "upstream": str(bare)}
+        )
+
+    def test_fork_ours_wins_the_origin_alias(self) -> None:
+        """`origin` is the *writable* canonical where one exists — our fork, not the base."""
+        base, _ = self._make_origin("base")
+        fork, _ = self._make_origin("fork")
+        self._write_repo_def("proj", sources={"upstream": str(base), "fork-ours": str(fork)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        self.assertEqual(
+            self._remotes("proj"),
+            {"origin": str(fork), "upstream": str(base), "fork-ours": str(fork)},
+        )
+
+    def test_conformance_is_idempotent(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        before = self._remotes("proj")
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)  # already present -> fetch path
+        self.assertEqual(self._remotes("proj"), before)
+
+    def test_a_def_change_is_applied_on_the_next_operation(self) -> None:
+        """Adopting a fork moves `origin` to it, and takes the old tracking refs with it."""
+        base, base_commits = self._make_origin("base")
+        self._write_repo_def("proj", sources={"upstream": str(base)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        repo_dir = self.bare / "proj"
+        self.assertEqual(
+            _git(["-C", str(repo_dir), "rev-parse", "refs/remotes/origin/main"], repo_dir),
+            base_commits[-1],
+        )
+
+        # Give the fork a commit of its own — the fixtures are otherwise byte-identical
+        # (pinned identity, same content, same second) and hash the same.
+        fork, _ = self._make_origin("fork")
+        fork_work = Path(self._tmp.name) / "fork-work"
+        fork_tip = _commit(fork_work, "diverged.txt", "ours\n")
+        _git(["-C", str(fork_work), "push", str(fork), "main"], fork_work)
+        self.assertNotEqual(base_commits[-1], fork_tip)  # guard the guard
+
+        self._write_repo_def("proj", sources={"upstream": str(base), "fork-ours": str(fork)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+
+        self.assertEqual(self._remotes("proj")["origin"], str(fork))
+        # Repoint is remove+re-add, so `refs/remotes/origin/*` now describes the fork
+        # alone. A `set-url` would have left the base's refs beside it, both current.
+        self.assertEqual(
+            _git(["-C", str(repo_dir), "rev-parse", "refs/remotes/origin/main"], repo_dir),
+            fork_tip,
+        )
+
+    def test_unrecognised_remotes_are_left_alone_and_reported(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        repo_dir = self.bare / "proj"
+        _git(["-C", str(repo_dir), "remote", "add", "scratch", "https://example.com/x.git"], repo_dir)
+
+        unknown = git.conform_remotes(git.GitRepo(repo_dir), {"origin": str(bare)})
+
+        self.assertEqual(unknown, ["scratch"])
+        self.assertIn("scratch", self._remotes("proj"))
+
+    def test_bare_clone_origin_gains_a_fetch_refspec(self) -> None:
+        """`clone --bare` sets a URL and no refspec, which is why fetching updated nothing."""
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        self.assertEqual(
+            self._refspec("proj", "origin"), "+refs/heads/*:refs/remotes/origin/*"
+        )
+
+    def test_fetch_now_advances_remote_tracking_and_leaves_heads_alone(self) -> None:
+        """The point of the refspec: acquisition can finally see new upstream commits."""
+        bare, _ = self._make_origin("proj")
+        self._write_repo_def("proj", sources={"origin": str(bare)})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        repo_dir = self.bare / "proj"
+        captured = _git(["-C", str(repo_dir), "rev-parse", "refs/heads/main"], repo_dir)
+
+        # Advance the origin behind our back, then re-acquire.
+        work = Path(self._tmp.name) / "proj-work"
+        moved = _commit(work, "c.txt", "three\n")
+        _git(["-C", str(work), "push", str(bare), "main"], work)
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+
+        self.assertEqual(
+            _git(["-C", str(repo_dir), "rev-parse", "refs/remotes/origin/main"], repo_dir),
+            moved,
+        )
+        # The local branch is ours and is not moved by a fetch.
+        self.assertEqual(
+            _git(["-C", str(repo_dir), "rev-parse", "refs/heads/main"], repo_dir), captured
+        )
