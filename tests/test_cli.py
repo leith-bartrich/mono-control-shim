@@ -79,9 +79,9 @@ class NoGitHubCredentialIsForwarded(unittest.TestCase):
     def _capture(self, *, artifact: bool) -> tuple[list[str], dict[str, str] | None]:
         seen: dict = {}
 
-        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+        def fake_exec(cmd, **kwargs):  # noqa: ANN001, ANN003
             seen["cmd"] = cmd
-            seen["env"] = env
+            seen["env"] = kwargs.get("env")
             return 0
 
         real_hostcontext = cli.HostContext
@@ -137,9 +137,9 @@ class BrokerInjection(unittest.TestCase):
     def _capture(self, *, artifact: bool) -> tuple[list[str], dict[str, str] | None]:
         seen: dict = {}
 
-        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+        def fake_exec(cmd, **kwargs):  # noqa: ANN001, ANN003
             seen["cmd"] = cmd
-            seen["env"] = env
+            seen["env"] = kwargs.get("env")
             return 0
 
         workspace = mock.MagicMock(spec=cli.Path)
@@ -194,7 +194,7 @@ class BrokerInjection(unittest.TestCase):
         """Step 1 is additive: the command must still run without a broker."""
         seen: dict = {}
 
-        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+        def fake_exec(cmd, **kwargs):  # noqa: ANN001, ANN003
             seen["cmd"] = cmd
             return 0
 
@@ -233,7 +233,7 @@ class WorkspaceDirsAreNotMounted(unittest.TestCase):
         """Run a dev-mode dispatch against a real *workspace*, capturing cmd + stderr."""
         seen: dict = {}
 
-        def fake_exec(cmd, *, env=None):  # noqa: ANN001
+        def fake_exec(cmd, **kwargs):  # noqa: ANN001, ANN003
             seen["cmd"] = cmd
             return 0
 

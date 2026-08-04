@@ -111,12 +111,44 @@ Some `mproj` commands act on the **workspace**, not on any artifact, and so do
 not take the `<verb>-<name>` form:
 
 ```
-mproj            # default: report the workspace and container availability
-mproj init       # bootstrap mono-config/, mono-repos-bare/ and mono-work/ dirs
+mproj            # default: report the workspace and docker reachability
+mproj init       # bootstrap mono-config/, mono-repos-bare/ and mono-work/ dirs,
+                 # and populate mono-config/ (clone / fresh / skip)
+mproj doctor     # diagnose the workspace and the docker engine, including a
+                 # live test that a container can actually start
 ```
 
 These are shim-native — they are about the workspace itself. Keep them as plain
 verbs; the `<verb>-<name>` form is reserved for operating on a specific artifact.
+
+`doctor` is a plain verb rather than `doctor-control` because what it diagnoses is
+the **host environment**, not an artifact: the engine failure that motivated it
+broke `docker run alpine` just as thoroughly as it broke mono-control. Should
+artifact-specific depth ever be wanted, `doctor-control` remains free in the
+reserved form, and the two would not collide.
+
+### Why checking out `mono-config/` extends `init` rather than adding a command
+
+Populating `mono-config/` looked like a candidate for its own command — something
+like `clone-config`. It is deliberately *not*, for two reasons.
+
+**The `<verb>-<name>` form was the wrong shape.** `clone-config` reads as an
+operation on a `config` *artifact*, and mono-config is not one: there is no image,
+no container, nothing to build or shell into. Borrowing the form would have made
+the artifact boundary this document exists to draw stop meaning anything.
+
+**It is the same job `init` already does.** `init` is the workspace bootstrap
+verb, it already creates `mono-config/`, and — because it *creates* the marker —
+it is already the one command that resolves its target without requiring the
+marker to exist (`_resolve_init_target`). Cloning into that directory is the same
+act carried through to something usable, so it belongs to the same verb rather
+than to a second command with its own bootstrap rules and its own ordering
+question against `init`.
+
+The trade accepted here: `init` cannot later *re-point* an existing config repo,
+because it refuses when a requested URL disagrees with the existing `origin`. That
+is a different act on an established workspace, not bootstrap, and it should get
+its own command if it is ever wanted.
 
 ## Generalizing to a second artifact
 
