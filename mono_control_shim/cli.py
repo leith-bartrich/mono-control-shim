@@ -14,9 +14,20 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from mono_control_shim.broker import BrokerServer, HostContext
+from mono_control_shim.git_run import (
+    GitError,
+    auth_summary,
+    config_reader,
+    identity_config,
+    is_auth_failure,
+    noninteractive_config,
+    noninteractive_env,
+    run_git,
+)
 
 # A directory is recognized as a mono workspace when it contains the manifest
 # directory `mono-config/`. A `mono-control/` checkout may or may not sit beside
@@ -135,10 +146,23 @@ def _resolve_init_target(explicit: str | None) -> Path:
     return Path.cwd()
 
 
-def _dev_container_available(workspace: Path) -> tuple[bool, str]:
-    """Best-effort check for mono-control's dev container availability.
+# How long the cheap probes wait on the docker CLI. A responsive daemon answers
+# `info` / `ps` in well under a second; a wedged one answers never, so a bound is
+# what turns "hangs forever" into "reports a problem".
+_PROBE_TIMEOUT = 10.0
 
-    Returns (available, human_readable_detail). Stdlib only; never raises.
+
+def _docker_reachability(workspace: Path) -> tuple[bool, str]:
+    """Layer 1: is the docker CLI there and does the daemon answer?
+
+    Returns (reachable, human_readable_detail). Stdlib only; never raises.
+
+    This is the **cheap** layer, and it deliberately claims only what it tested. A
+    daemon can answer ``docker info`` perfectly while being unable to start a single
+    container — that exact failure sent a developer hunting through mono-control and
+    Compose for something neither of them had done. Proving a container can actually
+    run costs a container run, so it lives in ``mproj doctor`` (layer 2) rather than
+    on the path of every command.
     """
     control = workspace / "mono-control"
 
@@ -162,7 +186,7 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
             [docker, "info"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=10,
+            timeout=_PROBE_TIMEOUT,
             check=False,
         )
         daemon_up = result.returncode == 0
@@ -172,7 +196,7 @@ def _dev_container_available(workspace: Path) -> tuple[bool, str]:
     if not daemon_up:
         return False, "docker installed and .devcontainer present, but docker daemon is not responding"
 
-    return True, "docker daemon reachable and .devcontainer config present"
+    return True, "daemon answered and mono-control/.devcontainer is present"
 
 
 # Directories that `mproj init` ensures exist in the workspace root. The broker acts
@@ -186,22 +210,280 @@ INIT_DIRS = ("mono-repos-bare", "mono-work", "mono-config")
 
 
 def _run_status(workspace: Path) -> int:
-    """Default command: report the workspace and dev container availability."""
+    """Default command: report the workspace and docker *reachability*.
+
+    Says "reachable", never "available". The word matters: this ran a single
+    ``docker info``, so the only honest claim is that the daemon answered. Pointing
+    at ``doctor`` in the same breath is what stops a green line here from being read
+    as "everything works" when containers cannot start.
+    """
     print(f"workspace: {workspace}")
 
-    available, detail = _dev_container_available(workspace)
-    status = "available" if available else "unavailable"
-    print(f"mono-control dev container: {status} ({detail})")
+    reachable, detail = _docker_reachability(workspace)
+    status = "reachable" if reachable else "unreachable"
+    print(f"docker: {status} ({detail})")
+    if reachable:
+        print(
+            "  reachability only - run `mproj doctor` to test that a container can "
+            "actually start"
+        )
 
     return 0
 
 
-def _run_init(workspace: Path) -> int:
+# --------------------------------------------------------------------------- #
+# `init`'s config source: clone / fresh / skip
+# --------------------------------------------------------------------------- #
+# What `init` should do about `mono-config/`. `SKIP` is the historical behavior —
+# create the empty directory and nothing more — kept as an explicit choice so
+# anything scripted against the old `mproj init` keeps working with one flag rather
+# than walking into a prompt.
+CONFIG_CLONE = "clone"
+CONFIG_FRESH = "fresh"
+CONFIG_SKIP = "skip"
+
+# The state `mono-config/` is in, which decides whether there is a question to ask.
+CONFIG_REPO = "repo"  # already a git repo: nothing to do, and nothing to ask
+CONFIG_EMPTY = "empty"  # absent, or present and empty: clonable
+CONFIG_OCCUPIED = "occupied"  # has content but is not a repo: refuse, never clobber
+
+# The initial branch for a `--config-fresh` repo. Named explicitly rather than left
+# to the host's `init.defaultBranch` so a fresh config repo is the same everywhere,
+# and via `--initial-branch` (not `-b`) to match `verbs/git.py`'s bare init.
+_FRESH_CONFIG_BRANCH = "main"
+
+
+def _config_state(config_dir: Path) -> str:
+    """Classify ``mono-config/`` into one of the three states above.
+
+    ``.git`` is tested with ``exists()`` rather than ``is_dir()`` because a worktree
+    or a submodule checkout carries it as a *file*; either way the directory is
+    already a repo and we must not touch it.
+    """
+    if (config_dir / ".git").exists():
+        return CONFIG_REPO
+    if not config_dir.exists():
+        return CONFIG_EMPTY
+    if any(config_dir.iterdir()):
+        return CONFIG_OCCUPIED
+    return CONFIG_EMPTY
+
+
+def _config_origin(config_dir: Path) -> str | None:
+    """The existing repo's ``origin`` URL, or None if it has no origin."""
+    try:
+        return run_git(["config", "--get", "remote.origin.url"], cwd=config_dir) or None
+    except GitError:
+        return None
+
+
+def _prompt_config_source(config_dir: Path) -> tuple[str, str | None] | None:
+    """Ask what to do about ``mono-config/``. Returns (choice, url) or None to abort.
+
+    Only ever reached on a TTY with no flag given — see ``_resolve_config_source``.
+    """
+    print(f"\nNo config repo at {config_dir}.")
+    print("mono-control reads the workspace manifest from there, so it needs one.\n")
+    print("  [1] Clone an existing config repo")
+    print("  [2] Create a fresh, empty config repo here")
+    print("  [3] Skip for now - just create the empty directory\n")
+
+    try:
+        choice = input("Choice [1]: ").strip() or "1"
+        if choice == "1":
+            url = input("Config repo URL: ").strip()
+            if not url:
+                print("error: no URL given", file=sys.stderr)
+                return None
+            return CONFIG_CLONE, url
+        if choice == "2":
+            return CONFIG_FRESH, None
+        if choice == "3":
+            return CONFIG_SKIP, None
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted", file=sys.stderr)
+        return None
+
+    print(f"error: not a choice: {choice!r}", file=sys.stderr)
+    return None
+
+
+def _resolve_config_source(
+    config_dir: Path,
+    *,
+    config_url: str | None,
+    config_fresh: bool,
+    no_config: bool,
+    isatty: bool,
+) -> tuple[str, str | None] | None:
+    """Decide the config source from the flags, or ask. None means "stop".
+
+    An explicit flag always wins and never prompts, so `init` stays scriptable. With
+    no flag the answer has to come from somewhere: a TTY gets the question, and a
+    non-TTY gets a *refusal* rather than a hang. That refusal is the same reflex as
+    the ``GIT_TERMINAL_PROMPT=0`` posture in ``git_run`` — when input is impossible,
+    fail fast and name the way out instead of blocking on something nobody can answer.
+    """
+    if config_url is not None:
+        return CONFIG_CLONE, config_url
+    if config_fresh:
+        return CONFIG_FRESH, None
+    if no_config:
+        return CONFIG_SKIP, None
+
+    if not isatty:
+        print(
+            "error: no config source given and stdin is not a terminal, so there is "
+            "nothing to ask.\n"
+            "  Pass one of --config-url URL, --config-fresh, or --no-config.",
+            file=sys.stderr,
+        )
+        return None
+
+    return _prompt_config_source(config_dir)
+
+
+def _clone_config(config_dir: Path, url: str) -> int:
+    """Clone *url* into ``mono-config/``.
+
+    Runs under the shared non-interactive posture, so a private config repo with no
+    usable host credential fails fast with the actionable hint instead of hanging on
+    a credential prompt. ``--`` separates the URL from the options so a value
+    starting with ``-`` can never be read as a flag.
+
+    The URL is deliberately *not* scheme-restricted. ``verbs/git.py`` allow-lists
+    https because there the URL arrives from the container; here the developer typed
+    it at their own shell, which is the same trust as running ``git clone`` by hand —
+    and ssh remotes and local paths are both legitimate.
+    """
+    print(f"config:  cloning {url}")
+    try:
+        run_git(
+            ["clone", "--", url, str(config_dir)],
+            env=noninteractive_env(),
+            config=noninteractive_config(),
+        )
+    except GitError as e:
+        message = str(e)
+        if is_auth_failure(message):
+            print(f"error: {auth_summary(url)}", file=sys.stderr)
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 1
+    print(f"config:  {config_dir} cloned")
+    return 0
+
+
+def _init_fresh_config(config_dir: Path) -> int:
+    """Create a brand-new, empty config repo at ``mono-config/``.
+
+    Given an empty root commit for the same reason ``verbs/git.py`` gives one to a
+    newly init'd bare repo (see ``GitRepo.write_root_commit``): ``git init`` leaves
+    HEAD on an *unborn* branch, so the branch does not exist until something is
+    committed. One empty commit means the repo has a real HEAD, a real branch, and a
+    diffable history from the moment it exists. No remote is added — pointing a fresh
+    config repo at one is a separate, later act.
+    """
+    try:
+        run_git(["init", "--initial-branch", _FRESH_CONFIG_BRANCH, str(config_dir)])
+        tree = run_git(["hash-object", "-w", "-t", "tree", os.devnull], cwd=config_dir)
+        commit = run_git(
+            ["commit-tree", tree, "-m", "initial commit"],
+            cwd=config_dir,
+            config=identity_config(config_reader(config_dir)),
+        )
+        run_git(
+            ["update-ref", f"refs/heads/{_FRESH_CONFIG_BRANCH}", commit], cwd=config_dir
+        )
+    except GitError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"config:  {config_dir} initialized fresh on {_FRESH_CONFIG_BRANCH} (no remote)")
+    return 0
+
+
+def _ensure_config(
+    workspace: Path,
+    *,
+    config_url: str | None,
+    config_fresh: bool,
+    no_config: bool,
+    isatty: bool,
+) -> int:
+    """Bring ``mono-config/`` into being, by whichever route was chosen.
+
+    An existing config repo short-circuits before any question is asked, which is
+    what keeps `init` idempotent: re-running it on a working workspace never
+    prompts, and the interactive path is reserved for a genuine bootstrap.
+    """
+    config_dir = workspace / WORKSPACE_MARKER
+    state = _config_state(config_dir)
+
+    if state == CONFIG_REPO:
+        origin = _config_origin(config_dir)
+        detail = f" (origin: {origin})" if origin else " (no origin)"
+        if config_url is not None and origin is not None and origin != config_url:
+            print(
+                f"error: {config_dir} is already a config repo with a different origin.\n"
+                f"  existing: {origin}\n"
+                f"  requested: {config_url}\n"
+                "  Repointing an existing config repo is not init's job - move or "
+                "remove it first, or change its remote with git.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"config:  {config_dir} is already a repo{detail}")
+        return 0
+
+    if state == CONFIG_OCCUPIED:
+        print(
+            f"error: {config_dir} has contents but is not a git repo.\n"
+            "  Refusing to clone or init over it. Move or remove it first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    resolved = _resolve_config_source(
+        config_dir,
+        config_url=config_url,
+        config_fresh=config_fresh,
+        no_config=no_config,
+        isatty=isatty,
+    )
+    if resolved is None:
+        return 1
+
+    choice, url = resolved
+    if choice == CONFIG_CLONE:
+        assert url is not None
+        # `git clone` is happy to write into an existing *empty* directory, which is
+        # exactly what the dir pass just made — so clone and init compose in either
+        # order without special-casing.
+        return _clone_config(config_dir, url)
+    if choice == CONFIG_FRESH:
+        return _init_fresh_config(config_dir)
+
+    print(f"config:  {config_dir} left empty (no config source)")
+    return 0
+
+
+def _run_init(
+    workspace: Path,
+    *,
+    config_url: str | None = None,
+    config_fresh: bool = False,
+    no_config: bool = False,
+    isatty: bool | None = None,
+) -> int:
     """Ensure the workspace has the managed directories the broker acts on.
 
     Creates ``mono-repos-bare/``, ``mono-work/`` and ``mono-config/`` in the
-    workspace root if they are missing. Idempotent: already-present directories are
-    left untouched.
+    workspace root if they are missing, then settles what ``mono-config/`` should
+    *contain* — a clone, a fresh repo, or nothing. Idempotent: already-present
+    directories are left untouched and an existing config repo is never touched.
+
+    The plain directories are made first so a failed clone still leaves a workspace
+    that ``mproj init`` can simply be re-run against.
     """
     print(f"workspace: {workspace}")
 
@@ -216,9 +498,18 @@ def _run_init(workspace: Path) -> int:
             print(f"created: {target}")
 
     if not created:
-        print("nothing to do: all workspace directories already exist")
+        print("all workspace directories already exist")
 
-    return 0
+    if isatty is None:
+        isatty = sys.stdin.isatty()
+
+    return _ensure_config(
+        workspace,
+        config_url=config_url,
+        config_fresh=config_fresh,
+        no_config=no_config,
+        isatty=isatty,
+    )
 
 
 def _warn_if_workspace_incomplete(workspace: Path) -> None:
@@ -234,6 +525,206 @@ def _warn_if_workspace_incomplete(workspace: Path) -> None:
         source = workspace / name
         if not source.is_dir():
             print(f"warning: {source} does not exist; run `mproj init`.", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# Layer 2: `doctor` — the live "can I actually run a container?" test
+# --------------------------------------------------------------------------- #
+# How long the live container test waits. Starting a container from an image that
+# is already local takes a second or two; a wedged engine accepts the *create* and
+# then never starts it, so the only thing that distinguishes the two is a clock.
+_LIVE_TEST_TIMEOUT = 30.0
+
+# What the live test runs. `true` exits 0 immediately and exists in every image this
+# shim deals with, so the test measures the engine's ability to start a container
+# rather than anything about the workload.
+_LIVE_TEST_ENTRYPOINT = "true"
+
+_WEDGED_ENGINE_HINT = (
+    "the docker engine accepted the container but never started it. This is the "
+    "engine wedging, not a mono-control problem - restart Docker Desktop, and if "
+    "that does not take, `wsl --shutdown` first (Windows) before starting it again."
+)
+
+
+def _check(ok: bool, label: str, detail: str) -> bool:
+    """Print one doctor line and pass the verdict back through."""
+    print(f"  [{'ok' if ok else 'FAIL'}] {label}: {detail}")
+    return ok
+
+
+def _local_image(docker: str) -> str | None:
+    """The mono-control image present locally, or None.
+
+    Deliberately never pulls. A doctor that reaches the network to test the local
+    engine would both fail offline and prove less: the point is whether *this*
+    machine can start a container from an image it already has.
+    """
+    probe = subprocess.run(
+        [docker, "image", "inspect", MONO_CONTROL_IMAGE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=_PROBE_TIMEOUT,
+        check=False,
+    )
+    return MONO_CONTROL_IMAGE if probe.returncode == 0 else None
+
+
+def _live_container_test(docker: str, image: str) -> tuple[bool, str]:
+    """Start a throwaway container and wait, bounded, for it to finish.
+
+    This is the check that ``docker info`` cannot make. A timeout here is the
+    signature of a wedged engine: create succeeds, start never happens, and every
+    `mproj control` hangs forever with no explanation.
+    """
+    try:
+        result = subprocess.run(
+            [docker, "run", "--rm", "--entrypoint", _LIVE_TEST_ENTRYPOINT, image],
+            capture_output=True,
+            text=True,
+            timeout=_LIVE_TEST_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, (
+            f"a container from {image} did not start within "
+            f"{int(_LIVE_TEST_TIMEOUT)}s - {_WEDGED_ENGINE_HINT}"
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"could not run the live container test: {e}"
+
+    if result.returncode != 0:
+        return False, f"container exited {result.returncode}: {result.stderr.strip()}"
+    return True, f"started and exited cleanly ({image})"
+
+
+def _run_doctor(workspace: Path | None) -> int:
+    """`mproj doctor` — the deep check, run only when asked.
+
+    Reports the workspace, then escalates through docker: on PATH, daemon
+    answering, and finally a real container start. Everything cheap runs first so a
+    plainly broken environment is named without waiting on the expensive test.
+
+    *workspace* may be None — a workspace that cannot be located is a finding to
+    report, not a reason to refuse to diagnose the rest.
+    """
+    ok = True
+
+    print("workspace:")
+    if workspace is None:
+        ok = _check(
+            False,
+            "location",
+            f"no directory containing {WORKSPACE_MARKER}/ found - run `mproj init`",
+        ) and ok
+    else:
+        _check(True, "location", str(workspace))
+        for name in INIT_DIRS:
+            target = workspace / name
+            ok = _check(
+                target.is_dir(), name, "present" if target.is_dir() else "missing - run `mproj init`"
+            ) and ok
+        state = _config_state(workspace / WORKSPACE_MARKER)
+        ok = _check(
+            state == CONFIG_REPO,
+            "config repo",
+            {
+                CONFIG_REPO: "a git repo",
+                CONFIG_EMPTY: "empty - run `mproj init --config-url URL`",
+                CONFIG_OCCUPIED: "has contents but is not a git repo",
+            }[state],
+        ) and ok
+
+    print("docker:")
+    docker = shutil.which("docker")
+    if docker is None:
+        _check(False, "cli", "not found on PATH")
+        return 1
+    _check(True, "cli", docker)
+
+    try:
+        info = subprocess.run(
+            [docker, "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT,
+            check=False,
+        )
+        reachable = info.returncode == 0
+        detail = "daemon answered" if reachable else "daemon returned an error"
+    except (OSError, subprocess.SubprocessError):
+        reachable, detail = False, "daemon did not answer in time"
+    if not _check(reachable, "daemon", detail):
+        return 1
+
+    # The live test needs a local image. Its absence is a finding of its own, not a
+    # reason to pull — and not a reason to call the engine healthy either.
+    try:
+        image = _local_image(docker)
+    except (OSError, subprocess.SubprocessError):
+        image = None
+    if image is None:
+        _check(
+            False,
+            "live container test",
+            f"skipped: no local {MONO_CONTROL_IMAGE} to test with - run "
+            "`mproj build-control` first",
+        )
+        return 1
+
+    live_ok, live_detail = _live_container_test(docker, image)
+    ok = _check(live_ok, "live container test", live_detail) and ok
+
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+# The startup watchdog: a hint, never a kill
+# --------------------------------------------------------------------------- #
+# How long a container run may go without the watchdog looking into it. Normal
+# starts are a second or two; a first-ever run builds the image first, which is
+# slow but creates no stuck container, so a build will not trip this.
+_STARTUP_HINT_AFTER = 20.0
+
+_STARTUP_HINT = (
+    "note: the container has not started yet. If this does not move, the docker "
+    "engine may be wedged - run `mproj doctor` in another terminal. Still waiting; "
+    "nothing has been cancelled."
+)
+
+
+def _containers_stuck_created(docker: str) -> bool:
+    """True if docker shows a container stuck in ``created``, or cannot answer.
+
+    ``created`` without ``running`` is the fingerprint of the wedge: the engine took
+    the container and never started it. A query that times out is treated as the
+    same symptom, because a daemon too wedged to answer ``ps`` is exactly the
+    condition worth reporting.
+    """
+    try:
+        result = subprocess.run(
+            [docker, "ps", "--filter", "status=created", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _watch_startup(docker: str, done: threading.Event) -> None:
+    """Wait out the grace period, then hint if the container never started.
+
+    Never touches the child process. A long `control` session or a slow
+    `test-control` is legitimate and must not be interrupted by a diagnostic — so
+    the watchdog's entire power is one line on stderr, printed once.
+    """
+    if done.wait(_STARTUP_HINT_AFTER):
+        return  # finished inside the grace period: nothing to say
+    if _containers_stuck_created(docker):
+        print(_STARTUP_HINT, file=sys.stderr)
 
 
 # Persistent uv cache volume so repeated `--rm` runs (e.g. test-control) don't
@@ -414,7 +905,7 @@ def _dev_run(
     # Only thread stdout_path when capturing (json-schema-control), so the ordinary
     # streaming call shape is byte-for-byte unchanged.
     extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
-    return _exec(cmd, env=_secret_environ(secrets), **extra)
+    return _exec(cmd, env=_secret_environ(secrets), watch_startup=True, **extra)
 
 
 def _artifact_run(
@@ -467,7 +958,7 @@ def _artifact_run(
     _warn_if_workspace_incomplete(workspace)
     cmd += [MONO_CONTROL_IMAGE, *inner_argv]
     extra = {"stdout_path": stdout_path} if stdout_path is not None else {}
-    return _exec(cmd, env=_secret_environ(secrets), **extra)
+    return _exec(cmd, env=_secret_environ(secrets), watch_startup=True, **extra)
 
 
 def _run_control(
@@ -529,6 +1020,7 @@ def _exec(
     *,
     env: dict[str, str] | None = None,
     stdout_path: Path | None = None,
+    watch_startup: bool = False,
 ) -> int:
     """Run *cmd*, inheriting stdio, and return its exit code as ours.
 
@@ -538,8 +1030,21 @@ def _exec(
     ``stdout_path`` redirects the child's stdout to that file (stderr still streams
     to ours) — how ``json-schema-control`` captures ``emit-schema``'s JSON into the
     repo while the broker's diagnostics stay on the terminal.
+
+    ``watch_startup`` arms the startup watchdog for container runs. It is opt-in
+    because there is nothing to watch for on an image build, and because the child's
+    exit code and stdio must be exactly what they were without it: the watchdog runs
+    on its own daemon thread, reads docker, and prints at most one line.
     """
+    watcher: threading.Thread | None = None
+    done = threading.Event()
     try:
+        if watch_startup and cmd:
+            watcher = threading.Thread(
+                target=_watch_startup, args=(cmd[0], done), daemon=True
+            )
+            watcher.start()
+
         if stdout_path is not None:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             with open(stdout_path, "w", encoding="utf-8", newline="\n") as out:
@@ -548,6 +1053,10 @@ def _exec(
     except (OSError, subprocess.SubprocessError) as e:
         print(f"error: failed to launch container: {e}", file=sys.stderr)
         return 1
+    finally:
+        # Release the watchdog whichever way we left: a finished run must not be
+        # followed by a hint about it not having started.
+        done.set()
 
 
 def _run_build_control(workspace: Path) -> int:
@@ -565,7 +1074,7 @@ def _run_build_control(workspace: Path) -> int:
         print(
             f"error: no mono-control checkout to build from.\n"
             f"  Expected a Dockerfile at {dockerfile}.\n"
-            f"  `build-control` needs the source — clone mono-control/ beside mono-config/.",
+            f"  `build-control` needs the source - clone mono-control/ beside mono-config/.",
             file=sys.stderr,
         )
         return 1
@@ -597,9 +1106,37 @@ def main(argv: list[str] | None = None) -> int:
     init_parser = subparsers.add_parser(
         "init",
         help="Create the mono-repos-bare/, mono-work/ and mono-config/ "
-        "directories the broker acts on, if they do not already exist.",
+        "directories the broker acts on, and populate mono-config/ by cloning an "
+        "existing config repo or creating a fresh one. Asks when run on a terminal "
+        "with none of the flags below.",
     )
     _add_workspace_arg(init_parser)
+    # Mutually exclusive so a contradictory pair is rejected by the parser rather
+    # than resolved by a precedence rule nobody can remember.
+    config_source = init_parser.add_mutually_exclusive_group()
+    config_source.add_argument(
+        "--config-url",
+        metavar="URL",
+        help="Clone the config repo from URL into mono-config/ (no prompt).",
+    )
+    config_source.add_argument(
+        "--config-fresh",
+        action="store_true",
+        help="Create a fresh, empty config repo in mono-config/ (no prompt).",
+    )
+    config_source.add_argument(
+        "--no-config",
+        action="store_true",
+        help="Create mono-config/ as an empty directory and nothing more - the "
+        "behavior of `init` before it learned to populate it (no prompt).",
+    )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Diagnose the workspace and the docker engine, including a live test "
+        "that a container can actually start (which plain reachability cannot prove).",
+    )
+    _add_workspace_arg(doctor_parser)
 
     control_parser = subparsers.add_parser(
         "control",
@@ -671,7 +1208,17 @@ def main(argv: list[str] | None = None) -> int:
     # `init` bootstraps the workspace, so it resolves its target without
     # requiring the mono-config marker to already exist.
     if args.command == "init":
-        return _run_init(_resolve_init_target(args.workspace))
+        return _run_init(
+            _resolve_init_target(args.workspace),
+            config_url=args.config_url,
+            config_fresh=args.config_fresh,
+            no_config=args.no_config,
+        )
+
+    # `doctor` diagnoses; a workspace it cannot find is one of its findings, so it
+    # runs before the gate that turns that into a hard error.
+    if args.command == "doctor":
+        return _run_doctor(resolve_workspace(args.workspace))
 
     workspace = resolve_workspace(args.workspace)
     if workspace is None:

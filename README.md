@@ -28,7 +28,11 @@ deliberate security goal: less code on the host means a smaller attack surface.
 - **Resolves the workspace location** (see [Commands](#commands) for the lookup order).
 - **Bootstraps the workspace** — `mproj init` creates the `mono-config/`,
   `mono-repos-bare/` and `mono-work/` directories (host-side dirs the broker acts
-  on: the bare repositories and the worktrees they are materialized into).
+  on: the bare repositories and the worktrees they are materialized into), and
+  populates `mono-config/` by cloning an existing config repo or creating a fresh
+  one. The shim has to own that checkout: `mono-config/` is the marker that makes a
+  directory a workspace, so nothing downstream — including mono-control, which
+  never touches the host filesystem — can create its own precondition.
 - **Runs and operates on the mono-control artifact** in its container — `mproj
   control` to run it, plus `build-control` / `shell-control` / `test-control` for
   its image and container. Naming follows a deliberate convention; see
@@ -69,13 +73,65 @@ This installs a `mproj` command on your `PATH`.
 ## Commands
 
 ```sh
-mproj                      # report the workspace and container availability
+mproj                      # report the workspace and docker reachability (cheap)
+mproj doctor               # diagnose deeply, incl. a live "can a container start?" test
 mproj init                 # bootstrap mono-config/, mono-repos-bare/ and mono-work/
 mproj control [args]       # run mono-control (args forward to its CLI; use -- for flags)
 mproj build-control        # build the mono-control image (mono-control:latest)
 mproj shell-control        # interactive shell in the mono-control container
 mproj test-control [args]  # run mono-control's tests (dev only; args forward to pytest)
 ```
+
+### Bootstrapping the config repo
+
+`mproj init` also settles what `mono-config/` should *contain*. A flag answers
+outright; with no flag it asks, but only on a terminal:
+
+```sh
+mproj init --config-url URL   # clone an existing config repo
+mproj init --config-fresh     # create a fresh, empty config repo (root commit, no remote)
+mproj init --no-config        # just the empty directory — `init`'s behavior before this
+mproj init                    # on a TTY: ask which of the three
+```
+
+Two properties worth relying on:
+
+- **It stays idempotent.** An existing config repo short-circuits before any
+  question, so re-running `init` on a working workspace never prompts. The
+  interactive path only fires during a genuine bootstrap.
+- **It never blocks.** With no flag and no terminal there is nobody to ask, so
+  `init` fails naming the three flags rather than hanging on stdin — the same
+  reflex as the non-interactive credential posture it clones under.
+
+`init` refuses rather than guesses in the two ambiguous cases: a `mono-config/`
+holding content but no `.git` is never clobbered, and a `--config-url` that
+disagrees with an existing repo's `origin` is reported, not silently repointed.
+
+### Health checks come in two layers
+
+The layers differ in **what they prove**, and the wording is chosen to match:
+
+| layer | runs | cost | catches |
+| ----- | ---- | ---- | ------- |
+| reachability (`mproj`, and before container runs) | `docker info`, bounded | sub-second | docker missing, daemon down |
+| liveness (`mproj doctor`, only when asked) | actually starts a throwaway container, bounded | ~1–2s warm | a **wedged engine** |
+
+The distinction is not academic. A Docker Desktop engine can answer `docker info`
+perfectly while being unable to start a single container — it accepts the create
+and never starts it, so every `mproj control` hangs forever. Reachability sees
+nothing wrong. That is why `mproj` says *reachable*, never *available*, and points
+at `doctor` in the same breath.
+
+`doctor` tests with the already-built `mono-control:latest` and **never pulls**: a
+doctor that reached the network would fail offline and prove less, since the
+question is whether *this* engine can start a container it already has. No local
+image is reported as its own finding, pointing at `mproj build-control`.
+
+Container runs also carry a **startup watchdog**. If a run has not got going within
+20s, the shim checks whether a container is sitting in `created` and, if so, prints
+one line on stderr naming `mproj doctor`. It never cancels anything — a REPL
+session or a long `test-control` is legitimately slow, so the watchdog's entire
+power is that one hint.
 
 Every command also accepts `--workspace PATH`. The naming follows a deliberate
 convention — `mproj <name>` runs an artifact, `mproj <name> <subcommand>`
@@ -190,9 +246,19 @@ mono-control-shim/
 │       └── command-conventions.md   # the mproj command-naming pattern
 ├── tests/
 │   ├── test_cli.py         # stdlib unittest; token resolution + secret plumbing
-│   └── test_broker.py      # broker auth, refusal and JSON-RPC taxonomy
+│   ├── test_broker.py      # broker auth, refusal and JSON-RPC taxonomy
+│   ├── test_init_config.py # `init`'s config source: clone / fresh / skip
+│   └── test_verbs_git.py   # the git verb pack, against real git
 └── mono_control_shim/
     ├── __init__.py
     ├── broker.py           # host-callback broker: transport + auth + verb dispatch
+    ├── git_run.py          # shared git seam: subprocess, credential posture, auth
+    ├── verbs/              # broker verb packs (git, mono_config)
     └── cli.py              # argparse CLI: workspace resolution + artifact ops
 ```
+
+`git_run.py` sits below both callers on purpose. The CLI runs git *before* any
+container exists (`init` populating `mono-config/`), so it cannot reach the verb
+layer — but it must not therefore get a weaker credential posture. Anything that
+knows about the managed model (slugs, bare roots, worktrees) stays in `verbs/git.py`;
+only the seam itself is shared.

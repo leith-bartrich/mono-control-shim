@@ -40,6 +40,13 @@ credential helper. What it *does* enforce is a strictly non-interactive posture
 with no usable credential fails fast — on every platform — instead of hanging on a
 TTY prompt or a GUI popup; the failure is then reworded into an actionable
 "set up gh / a credential helper" summary (see ``is_auth_failure``).
+
+That posture, the subprocess seam it rides on, and the auth classifier now live in
+``mono_control_shim.git_run`` — shared with the CLI, which runs git *before* any
+container exists (``mproj init`` populating ``mono-config/``) and so cannot reach
+this layer. They are re-exported here under their original names: this module
+remains the only place that pairs them with the managed model (slugs, bare roots,
+worktrees), which is what the container talks to.
 """
 
 from __future__ import annotations
@@ -48,7 +55,6 @@ import json
 import os
 import platform
 import re
-import subprocess
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -60,6 +66,18 @@ from mono_control_shim.broker import (
     HostContext,
     VerbError,
     verb,
+)
+from mono_control_shim.git_run import (  # the shared chokepoint (see module docstring)
+    AUTH_MARKERS,
+    FALLBACK_IDENTITY as _FALLBACK_IDENTITY,
+    AUTH_HINT as _AUTH_HINT,
+    GitError,
+    auth_summary as _auth_summary,
+    identity_config,
+    is_auth_failure,
+    noninteractive_config as _noninteractive_config,
+    noninteractive_env as _noninteractive_env,
+    run_git,
 )
 
 # The stamp that makes a bare repo self-identifying. Reading it (dir -> slug) needs
@@ -100,45 +118,6 @@ _PROFILE_KEYS = (
 # local file, an ssh session, or a transport helper.
 _ALLOWED_URL_SCHEMES = frozenset({"https"})
 
-# stderr substrings (matched case-insensitively) that mark a git network failure as
-# an auth / credential problem — as opposed to a missing repo, a DNS failure, or a
-# refused connection. Adapted for the host-side reality: with the non-interactive
-# posture below, a private remote with no usable credential fails with one of these
-# rather than hanging on a prompt.
-AUTH_MARKERS = (
-    "authentication failed",
-    "could not read username",
-    "could not read password",
-    "terminal prompts disabled",
-    "invalid username or password",
-    "support for password authentication was removed",
-    "the requested url returned error: 403",
-    "error: 403",
-    "remote: permission to",
-    "remote: repository not found",
-)
-
-# The actionable hint appended to an auth failure. Reworded for host-side git: the
-# fix is no longer "export a token for the container" but "give host git a credential".
-_AUTH_HINT = (
-    "git runs on the host now and found no usable GitHub credential. Set one up on "
-    "the host — run `gh auth login` (easiest; makes gh git's credential helper), or "
-    "configure a credential helper / fine-grained PAT for github.com."
-)
-
-
-def is_auth_failure(stderr: str) -> bool:
-    """True when *stderr* (or a ``GitError`` message wrapping it) looks like an
-    auth / credential failure rather than any other network error."""
-    low = stderr.lower()
-    return any(marker in low for marker in AUTH_MARKERS)
-
-
-def _auth_summary(target: str) -> str:
-    """The actionable summary for an auth failure against *target* (a slug or URL)."""
-    return f"authentication failed for {target}: {_AUTH_HINT}"
-
-
 # --------------------------------------------------------------------------- #
 # FS-capability profile (relocated from host_platform)
 # --------------------------------------------------------------------------- #
@@ -167,105 +146,19 @@ def host_profile() -> FsProfile:
 
 
 # --------------------------------------------------------------------------- #
-# The single git subprocess chokepoint (relocated from git/runner.py)
+# Managed-model errors (the seam itself lives in git_run)
 # --------------------------------------------------------------------------- #
-class GitError(Exception):
-    """A git operation failed: a missing binary or a non-zero exit."""
-
-
 class UnmanagedCheckoutError(GitError):
     """A repo carries no ``mono-control.slug`` stamp (foreign / unmanaged)."""
-
-
-def run_git(
-    args: list[str],
-    *,
-    cwd: Optional[Path] = None,
-    env: Optional[dict[str, str]] = None,
-    config: Optional[list[str]] = None,
-) -> str:
-    """Run ``git [config...] <args>`` and return stripped stdout.
-
-    List-form args only — never a shell string — so a URL or ref can never be
-    reinterpreted by a shell. ``config`` holds ``-c key=value`` pairs that must
-    precede the subcommand (e.g. the non-interactive posture). A non-zero exit
-    raises ``GitError`` with stderr; a missing binary raises ``GitError`` too.
-    """
-    command = ["git", *(config or []), *args]
-    try:
-        result = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd is not None else None,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-        )
-    except FileNotFoundError as e:  # pragma: no cover - git present in CI
-        raise GitError("git executable not found on PATH") from e
-    if result.returncode != 0:
-        # No secret to redact: the broker injects no token — host git supplies its
-        # own credential — so the raw stderr is safe to surface (and is what the
-        # auth classifier reads).
-        raise GitError(f"`git {' '.join(args)}` failed: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-# ``-c`` config that makes a git call strictly non-interactive on the credential
-# axis: ``credential.interactive=false`` tells Git Credential Manager (and other
-# helpers that honor it) to fail rather than pop a GUI prompt. Paired with the
-# ``GIT_TERMINAL_PROMPT=0`` env below, a missing credential becomes a fast, clean
-# error on every platform instead of a hang.
-_NONINTERACTIVE_CONFIG = ("-c", "credential.interactive=false")
-
-
-def _noninteractive_config() -> list[str]:
-    """``-c`` flags enforcing the non-interactive credential posture."""
-    return list(_NONINTERACTIVE_CONFIG)
-
-
-# Identity for the root commit ``init`` writes, used only for fields the host has not
-# configured. The address is deliberately unroutable (RFC 2606 ``.invalid``): a
-# machine-made commit should not look like it came from a real mailbox.
-_FALLBACK_IDENTITY = (
-    ("user.name", "mono-control"),
-    ("user.email", "mono-control@invalid"),
-)
 
 
 def _identity_config(repo: "GitRepo") -> list[str]:
     """``-c user.*`` pairs for identity fields the host hasn't set.
 
-    The user's own identity is preferred, so a commit made on their behalf looks like
-    the rest of their history. The fallback applies per field, and only when a field
-    is missing, so ``repo init`` still works on a fresh machine with no git identity
-    configured rather than failing at the last step.
+    Reads through the repo handle (rather than ``git_run.config_reader``) so the
+    lookup goes via ``GitRepo.config_get`` — the managed model's own accessor.
     """
-    config: list[str] = []
-    for key, fallback in _FALLBACK_IDENTITY:
-        try:
-            if repo.config_get(key):
-                continue
-        except GitError:
-            pass  # unset: `config --get` exits non-zero on a missing key
-        config += ["-c", f"{key}={fallback}"]
-    return config
-
-
-def _noninteractive_env(*, https_only: bool = False) -> dict[str, str]:
-    """The environment for a network git call: strictly non-interactive, no token.
-
-    ``GIT_TERMINAL_PROMPT=0`` stops git itself from prompting on a TTY, turning a
-    missing credential into a clean error. Host git supplies its own credential, so
-    nothing is injected here. ``https_only`` adds ``GIT_ALLOW_PROTOCOL=https`` for
-    the one verb whose URL the container supplies (a security allow-list, unrelated
-    to credentials).
-    """
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    if https_only:
-        env["GIT_ALLOW_PROTOCOL"] = "https"
-    return env
+    return identity_config(repo.config_get)
 
 
 # --------------------------------------------------------------------------- #
