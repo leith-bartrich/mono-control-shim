@@ -87,7 +87,7 @@ class Layer1ClaimsOnlyWhatItTested(unittest.TestCase):
 
         with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
             with mock.patch.object(cli.subprocess, "run", spy):
-                cli._docker_reachability(self.workspace)
+                cli._docker_reachability()
 
         self.assertTrue(seen)
         for command in seen:
@@ -99,7 +99,7 @@ class Layer1ClaimsOnlyWhatItTested(unittest.TestCase):
 
         with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
             with mock.patch.object(cli.subprocess, "run", timeout):
-                reachable, detail = cli._docker_reachability(self.workspace)
+                reachable, detail = cli._docker_reachability()
 
         self.assertFalse(reachable)
         self.assertIn("not responding", detail)
@@ -114,9 +114,144 @@ class Layer1ClaimsOnlyWhatItTested(unittest.TestCase):
 
         with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
             with mock.patch.object(cli.subprocess, "run", spy):
-                cli._docker_reachability(self.workspace)
+                cli._docker_reachability()
 
         self.assertTrue(all(k.get("timeout") for k in seen))
+
+
+class ReachabilityIsAboutTheHostAlone(unittest.TestCase):
+    """The regression: a workspace with no checkout is not a broken docker.
+
+    Reachability once folded in "is there a `mono-control/` checkout with a
+    `.devcontainer`", so an artifact-only workspace — the ordinary way to *consume*
+    the tool — printed `docker: unreachable` while `mproj control` ran fine in it.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name)  # no mono-control/ at all
+
+    def test_reachability_takes_no_workspace_at_all(self) -> None:
+        """It cannot conflate the two if it cannot see the workspace."""
+        import inspect
+
+        params = inspect.signature(cli._docker_reachability).parameters
+        self.assertEqual(list(params), [])
+
+    def test_an_artifact_only_workspace_reports_docker_reachable(self) -> None:
+        with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
+            with mock.patch.object(cli.subprocess, "run", _completed(0)):
+                code, out, _ = _capture(cli._run_status, self.workspace)
+
+        self.assertEqual(code, 0)
+        self.assertIn("docker: reachable", out)
+        self.assertNotIn("docker: unreachable", out)
+
+    def test_a_missing_checkout_is_not_reported_as_a_docker_problem(self) -> None:
+        with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
+            with mock.patch.object(cli.subprocess, "run", _completed(0)):
+                _, out, _ = _capture(cli._run_status, self.workspace)
+
+        docker_line = next(ln for ln in out.splitlines() if ln.startswith("docker:"))
+        self.assertNotIn("devcontainer", docker_line)
+        self.assertNotIn("mono-control", docker_line)
+
+
+class ModeIsReportedAsInformation(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = Path(self._tmp.name)
+
+    def _make_checkout(self, *, compose: bool = True) -> None:
+        devcontainer = self.workspace / "mono-control" / ".devcontainer"
+        devcontainer.mkdir(parents=True)
+        if compose:
+            (devcontainer / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    def test_a_checkout_selects_dev_mode(self) -> None:
+        self._make_checkout()
+        self.assertEqual(cli._selected_mode(self.workspace), cli.MODE_DEV)
+
+    def test_no_checkout_selects_artifact_mode(self) -> None:
+        self.assertEqual(cli._selected_mode(self.workspace), cli.MODE_ARTIFACT)
+
+    def test_a_local_image_never_beats_a_checkout(self) -> None:
+        """`_dispatch` never consults the image; the report must not either."""
+        self._make_checkout()
+        seen: list[list[str]] = []
+
+        def spy(command, **kwargs):  # noqa: ANN001, ANN003
+            seen.append(command)
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="")
+
+        with mock.patch.object(cli.subprocess, "run", spy):
+            mode, ready, _ = cli._mode_status(self.workspace, DOCKER)
+
+        self.assertEqual(mode, cli.MODE_DEV)
+        self.assertTrue(ready)
+        self.assertEqual(seen, [], "dev mode must not probe the artifact image")
+
+    def test_dev_mode_is_reported_in_status(self) -> None:
+        self._make_checkout()
+        with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
+            with mock.patch.object(cli.subprocess, "run", _completed(0)):
+                _, out, _ = _capture(cli._run_status, self.workspace)
+
+        self.assertIn(f"mode: {cli.MODE_DEV}", out)
+
+    def test_artifact_mode_is_reported_in_status(self) -> None:
+        with mock.patch.object(cli.shutil, "which", return_value=DOCKER):
+            with mock.patch.object(cli.subprocess, "run", _completed(0)):
+                _, out, _ = _capture(cli._run_status, self.workspace)
+
+        self.assertIn(f"mode: {cli.MODE_ARTIFACT}", out)
+
+    def test_neither_mode_is_a_failure(self) -> None:
+        """Having no checkout is the ordinary way to consume the tool."""
+        for make in (lambda: None, self._make_checkout):
+            with self.subTest(make=make):
+                make()
+                with mock.patch.object(cli.subprocess, "run", _completed(0)):
+                    _, ready, _ = cli._mode_status(self.workspace, DOCKER)
+                self.assertTrue(ready)
+
+    def test_a_checkout_without_a_compose_file_is_not_ready(self) -> None:
+        """Dev mode would error here, so the report must not call it fine."""
+        self._make_checkout(compose=False)
+
+        mode, ready, detail = cli._mode_status(self.workspace, DOCKER)
+
+        self.assertEqual(mode, cli.MODE_DEV)
+        self.assertFalse(ready)
+        self.assertIn("docker-compose.yml", detail)
+
+    def test_artifact_mode_without_an_image_is_not_ready(self) -> None:
+        def no_image(command, **kwargs):  # noqa: ANN001, ANN003
+            rc = 1 if "image" in command else 0
+            return subprocess.CompletedProcess(args=command, returncode=rc, stdout="")
+
+        with mock.patch.object(cli.subprocess, "run", no_image):
+            mode, ready, detail = cli._mode_status(self.workspace, DOCKER)
+
+        self.assertEqual(mode, cli.MODE_ARTIFACT)
+        self.assertFalse(ready)
+        self.assertIn("build-control", detail)
+
+    def test_an_unreachable_daemon_does_not_claim_the_image_is_there(self) -> None:
+        mode, ready, detail = cli._mode_status(self.workspace, None)
+
+        self.assertEqual(mode, cli.MODE_ARTIFACT)
+        self.assertTrue(ready)
+        self.assertIn("would run", detail)
+
+    def test_status_is_a_report_and_always_exits_zero(self) -> None:
+        """`doctor` owns the verdict; this line stays cheap and descriptive."""
+        with mock.patch.object(cli.shutil, "which", return_value=None):
+            code, _, _ = _capture(cli._run_status, self.workspace)
+
+        self.assertEqual(code, 0)
 
 
 class DoctorRunsALiveTest(unittest.TestCase):
@@ -195,6 +330,50 @@ class DoctorRunsALiveTest(unittest.TestCase):
         self.assertIn("build-control", out)
         for command in seen:
             self.assertNotIn("pull", command, "doctor must stay offline")
+
+    def test_it_reports_which_mode_the_workspace_will_use(self) -> None:
+        _, out, _ = self._run(_completed(0))
+
+        self.assertIn("mode:", out)
+        self.assertIn(cli.MODE_ARTIFACT, out)
+
+    def test_a_dev_workspace_is_reported_as_dev(self) -> None:
+        devcontainer = self.workspace / "mono-control" / ".devcontainer"
+        devcontainer.mkdir(parents=True)
+        (devcontainer / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+        code, out, _ = self._run(_completed(0))
+
+        self.assertEqual(code, 0, out)
+        self.assertIn(cli.MODE_DEV, out)
+
+    def test_dev_mode_is_not_failed_over_a_missing_artifact_image(self) -> None:
+        """Dev mode never runs that image; failing over it would be a false alarm."""
+        devcontainer = self.workspace / "mono-control" / ".devcontainer"
+        devcontainer.mkdir(parents=True)
+        (devcontainer / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+        def no_image(command, **kwargs):  # noqa: ANN001, ANN003
+            rc = 1 if "image" in command else 0
+            return subprocess.CompletedProcess(args=command, returncode=rc, stdout="")
+
+        code, out, _ = self._run(no_image)
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped", out)
+        self.assertIn("does not use it", out)
+
+    def test_artifact_mode_still_fails_over_a_missing_image(self) -> None:
+        """Same missing image, opposite verdict — artifact mode cannot run at all."""
+
+        def no_image(command, **kwargs):  # noqa: ANN001, ANN003
+            rc = 1 if "image" in command else 0
+            return subprocess.CompletedProcess(args=command, returncode=rc, stdout="")
+
+        code, out, _ = self._run(no_image)
+
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL", out)
 
     def test_a_missing_docker_cli_stops_before_the_daemon_check(self) -> None:
         with mock.patch.object(cli.shutil, "which", return_value=None):

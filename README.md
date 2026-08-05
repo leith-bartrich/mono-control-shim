@@ -122,6 +122,31 @@ and never starts it, so every `mproj control` hangs forever. Reachability sees
 nothing wrong. That is why `mproj` says *reachable*, never *available*, and points
 at `doctor` in the same breath.
 
+Reachability is a question about the **host alone**. It knows nothing about the
+workspace, deliberately: an earlier version folded in "is there a `mono-control/`
+checkout" and so reported `docker: unreachable` on an artifact-only workspace —
+the ordinary way to *consume* the tool — while `mproj control` ran fine in it.
+
+### Mode is reported, not judged
+
+Both `mproj` and `mproj doctor` say which backend a workspace will use:
+
+```
+mode: dev - runs live source via Compose (mono-control/ checkout)
+mode: artifact - runs the prebuilt mono-control:latest (no mono-control/ checkout)
+```
+
+Neither is a failure; the report mirrors `_dispatch`'s own test (the presence of a
+`mono-control/` directory) so it cannot disagree with what actually runs. Note a
+local `mono-control:latest` never beats a checkout, however fresh the image is.
+
+A mode is only *not ready* when the selected backend genuinely cannot run: a
+checkout whose `docker-compose.yml` is missing, or artifact mode with no image
+built. Because mode is known, `doctor` also stops failing a dev workspace over a
+missing `mono-control:latest` — dev mode never runs that image.
+
+`mproj` is a report and always exits 0; `doctor` is the verdict and exits non-zero.
+
 `doctor` tests with the already-built `mono-control:latest` and **never pulls**: a
 doctor that reached the network would fail offline and prove less, since the
 question is whether *this* engine can start a container it already has. No local
