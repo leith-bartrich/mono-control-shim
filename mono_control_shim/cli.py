@@ -152,35 +152,28 @@ def _resolve_init_target(explicit: str | None) -> Path:
 _PROBE_TIMEOUT = 10.0
 
 
-def _docker_reachability(workspace: Path) -> tuple[bool, str]:
+def _docker_reachability() -> tuple[bool, str]:
     """Layer 1: is the docker CLI there and does the daemon answer?
 
     Returns (reachable, human_readable_detail). Stdlib only; never raises.
 
-    This is the **cheap** layer, and it deliberately claims only what it tested. A
-    daemon can answer ``docker info`` perfectly while being unable to start a single
-    container — that exact failure sent a developer hunting through mono-control and
-    Compose for something neither of them had done. Proving a container can actually
-    run costs a container run, so it lives in ``mproj doctor`` (layer 2) rather than
-    on the path of every command.
+    **Purely a question about the host.** It deliberately knows nothing about the
+    workspace. An earlier version folded in "does a `mono-control/` checkout with a
+    `.devcontainer` exist" and returned False when it did not — which reported
+    *docker* as unreachable on a workspace with no checkout. That is the normal
+    end-user setup, the one artifact mode exists to serve, and docker was fine:
+    `mproj control` ran and answered correctly in exactly the workspace this line
+    called broken. Which mode a workspace will run in is now ``_mode_status``, and
+    it is information rather than a verdict.
+
+    This is also the **cheap** layer, and it claims only what it tested. A daemon
+    can answer ``docker info`` perfectly while being unable to start a single
+    container, so proving that costs a container run and lives in ``mproj doctor``.
     """
-    control = workspace / "mono-control"
-
-    devcontainer = control / ".devcontainer"
-    has_config = (
-        devcontainer.is_dir()
-        or (control / ".devcontainer.json").is_file()
-    )
-
     docker = shutil.which("docker")
     if docker is None:
-        detail = "docker not found on PATH"
-        return False, detail
+        return False, "docker not found on PATH"
 
-    if not has_config:
-        return False, f"docker found ({docker}) but no .devcontainer config in mono-control"
-
-    # docker exists and config exists; probe the daemon non-fatally.
     try:
         result = subprocess.run(
             [docker, "info"],
@@ -194,9 +187,61 @@ def _docker_reachability(workspace: Path) -> tuple[bool, str]:
         daemon_up = False
 
     if not daemon_up:
-        return False, "docker installed and .devcontainer present, but docker daemon is not responding"
+        return False, f"docker found ({docker}) but the daemon is not responding"
 
-    return True, "daemon answered and mono-control/.devcontainer is present"
+    return True, "daemon answered"
+
+
+# --------------------------------------------------------------------------- #
+# Which backend this workspace will use — information, not a verdict
+# --------------------------------------------------------------------------- #
+MODE_DEV = "dev"
+MODE_ARTIFACT = "artifact"
+
+
+def _selected_mode(workspace: Path) -> str:
+    """The backend ``_dispatch`` will choose for this workspace.
+
+    Mirrors ``_dispatch``'s own test exactly — the presence of a ``mono-control/``
+    *directory* — because a mode report that disagrees with the dispatcher is worse
+    than no report. Note the local ``mono-control:latest`` image is not consulted:
+    a checkout always wins, however fresh the image is.
+    """
+    return MODE_DEV if (workspace / "mono-control").is_dir() else MODE_ARTIFACT
+
+
+def _mode_status(workspace: Path, docker: str | None) -> tuple[str, bool, str]:
+    """(mode, ready, detail) for the backend this workspace will use.
+
+    Neither mode is a failure — having no checkout is the ordinary way to consume
+    the tool. ``ready`` is False only when the *selected* mode cannot actually run:
+    a checkout whose compose file is missing, or artifact mode with no image built.
+
+    *docker* is the CLI path when the daemon is reachable, else None; without it the
+    artifact image cannot be probed, so the report says what it will do rather than
+    claiming the image is there.
+    """
+    mode = _selected_mode(workspace)
+
+    if mode == MODE_DEV:
+        compose = workspace / "mono-control" / ".devcontainer" / "docker-compose.yml"
+        if not compose.is_file():
+            return mode, False, f"mono-control/ present but {compose} is missing"
+        return mode, True, "runs live source via Compose (mono-control/ checkout)"
+
+    if docker is None:
+        return mode, True, f"would run {MONO_CONTROL_IMAGE} (no mono-control/ checkout)"
+
+    try:
+        image = _local_image(docker)
+    except (OSError, subprocess.SubprocessError):
+        image = None
+    if image is None:
+        return mode, False, (
+            f"no {MONO_CONTROL_IMAGE} image and no mono-control/ checkout - run "
+            "`mproj build-control` from a workspace that has the source"
+        )
+    return mode, True, f"runs the prebuilt {image} (no mono-control/ checkout)"
 
 
 # Directories that `mproj init` ensures exist in the workspace root. The broker acts
@@ -212,6 +257,10 @@ INIT_DIRS = ("mono-repos-bare", "mono-work", "mono-config")
 def _run_status(workspace: Path) -> int:
     """Default command: report the workspace and docker *reachability*.
 
+    A **report**, not a verdict — it always exits 0, and ``doctor`` is where a
+    problem becomes an exit code. That division is deliberate: this runs on the hot
+    path, so it stays cheap and descriptive.
+
     Says "reachable", never "available". The word matters: this ran a single
     ``docker info``, so the only honest claim is that the daemon answered. Pointing
     at ``doctor`` in the same breath is what stops a green line here from being read
@@ -219,9 +268,15 @@ def _run_status(workspace: Path) -> int:
     """
     print(f"workspace: {workspace}")
 
-    reachable, detail = _docker_reachability(workspace)
-    status = "reachable" if reachable else "unreachable"
-    print(f"docker: {status} ({detail})")
+    reachable, detail = _docker_reachability()
+    print(f"docker: {'reachable' if reachable else 'unreachable'} ({detail})")
+
+    docker = shutil.which("docker") if reachable else None
+    mode, ready, mode_detail = _mode_status(workspace, docker)
+    print(f"mode: {mode} - {mode_detail}")
+    if not ready:
+        print(f"  the {mode} backend cannot run as configured; `mproj doctor` has the detail")
+
     if reachable:
         print(
             "  reachability only - run `mproj doctor` to test that a container can "
@@ -659,18 +714,32 @@ def _run_doctor(workspace: Path | None) -> int:
 
     # The live test needs a local image. Its absence is a finding of its own, not a
     # reason to pull — and not a reason to call the engine healthy either.
+    # Which backend this workspace will use. Reported for its own sake — the rest of
+    # this cannot be read correctly without it — and because it decides whether a
+    # missing artifact image is a failure or an irrelevance.
+    mode = MODE_ARTIFACT
+    if workspace is not None:
+        print("mode:")
+        mode, mode_ready, mode_detail = _mode_status(workspace, docker)
+        ok = _check(mode_ready, mode, mode_detail) and ok
+
     try:
         image = _local_image(docker)
     except (OSError, subprocess.SubprocessError):
         image = None
     if image is None:
-        _check(
-            False,
-            "live container test",
-            f"skipped: no local {MONO_CONTROL_IMAGE} to test with - run "
-            "`mproj build-control` first",
+        # Absence means different things per mode: artifact mode cannot run at all
+        # without this image, while dev mode never uses it — so failing a dev
+        # workspace over it would report it broken for an image it does not need.
+        detail = (
+            f"no local {MONO_CONTROL_IMAGE} to test the engine with - run "
+            "`mproj build-control` first"
         )
-        return 1
+        if mode == MODE_ARTIFACT:
+            _check(False, "live container test", detail)
+            return 1
+        _check(True, "live container test", f"skipped: {detail} (dev mode does not use it)")
+        return 0 if ok else 1
 
     live_ok, live_detail = _live_container_test(docker, image)
     ok = _check(live_ok, "live container test", live_detail) and ok
@@ -876,10 +945,10 @@ def _dev_run(
 ) -> int:
     """Dev mode: run *inner_argv* via the checked-out mono-control's Compose.
 
-    Runs the base ``docker-compose.yml`` (not the VS Code overlay) and bind-mounts
-    the live `mono-control/` checkout over the image's baked-in copy, so the
-    editable install resolves to the working tree — code edits take effect with no
-    rebuild. ``--build`` is still needed for image / dependency changes.
+    Runs ``docker-compose.yml`` and bind-mounts the live `mono-control/` checkout
+    over the image's baked-in copy, so the editable install resolves to the working
+    tree — code edits take effect with no rebuild. ``--build`` is still needed for
+    image / dependency changes, which the mount does not shadow.
     """
     compose = workspace / "mono-control" / ".devcontainer" / "docker-compose.yml"
     if not compose.is_file():
