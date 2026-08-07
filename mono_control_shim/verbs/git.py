@@ -208,6 +208,25 @@ class GitRepo:
     def config_get(self, key: str) -> str:
         return self._git("config", "--get", key)
 
+    def set_upstream(self, branch: str, remote: str = ORIGIN) -> bool:
+        """Point ``branch`` at ``remote``'s copy of it. False if there is none.
+
+        Config writes, not a network call: ``branch.<n>.remote`` + ``.merge`` are
+        what ``git pull`` reads. Skipped rather than forced when the remote-tracking
+        ref is absent — a line that exists only locally has nothing to track, and
+        inventing an upstream would make ``pull`` fail later instead of now.
+        """
+        if self.resolve_ref(f"refs/remotes/{remote}/{branch}") is None:
+            return False
+        self._git("config", f"branch.{branch}.remote", remote)
+        self._git("config", f"branch.{branch}.merge", f"refs/heads/{branch}")
+        return True
+
+    def local_branches(self) -> list[str]:
+        """Every local branch name (``refs/heads/*``)."""
+        out = self._git("for-each-ref", "--format=%(refname:short)", "refs/heads")
+        return [line for line in out.splitlines() if line]
+
     def attached_branch(self) -> Optional[str]:
         """The branch HEAD is attached to, or ``None`` when detached.
 
@@ -832,6 +851,35 @@ def conform_remotes(repo: GitRepo, sources: dict[str, str]) -> list[str]:
     return sorted(existing - set(desired))
 
 
+def conform_tracking(repo: GitRepo) -> list[str]:
+    """Re-point every local branch at ``origin``'s copy, where one exists.
+
+    Conformance repoints a remote by remove-then-re-add, because ``set-url`` would
+    leave ``refs/remotes/<name>/*`` describing the *old* remote — both remotes'
+    branches under one name, all looking current. But ``git remote remove`` also
+    wipes ``branch.<n>.remote`` / ``.merge`` for anything tracking it, so a
+    repoint silently strips tracking and it stays gone until someone notices
+    ``git pull`` complaining.
+
+    Re-asserting it here is what closes that: conformance runs on every operation,
+    so tracking is restored on the next one rather than left for a human to spot.
+    Idempotent and additive, like the rest of conformance — branches with no
+    counterpart on ``origin`` are skipped, not invented.
+    """
+    restored: list[str] = []
+    try:
+        branches = repo.local_branches()
+    except GitError:
+        return restored
+    for branch in branches:
+        try:
+            if repo.set_upstream(branch):
+                restored.append(branch)
+        except GitError:
+            continue
+    return restored
+
+
 def _resolve_ref(repo: GitRepo, ref: str) -> Optional[str]:
     """Resolve ``ref`` locally, falling back from ``refs/heads/x`` to origin's copy."""
     commit = repo.resolve_ref(ref)
@@ -922,6 +970,7 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
         failed = _fetch_origin(repo, slug)
         if failed is not None:
             return failed
+        conform_tracking(repo)
         return _verify_refs(repo, refs, "cloned", f"cloned {slug!r}", slug)
 
     # Present locally (offline or materialized) -> conform remotes, then fetch.
@@ -931,6 +980,10 @@ def _acquire(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, An
         failed = _fetch_origin(repo, slug)
         if failed is not None:
             return failed
+        # After the fetch, so a branch whose counterpart only just arrived gets
+        # tracking too. This is also the self-heal for a repoint, which drops
+        # tracking along with the old remote.
+        conform_tracking(repo)
     if source_url is None and not refs:
         return _src("ok", f"{slug!r} present, no source to fetch")
     return _verify_refs(repo, refs, "fetched", f"fetched {slug!r}", slug)
@@ -1096,7 +1149,11 @@ def _checkout_branch(params: dict[str, Any], ctx: Optional[HostContext]) -> dict
         repo.checkout(branch)
     except GitError as e:
         return _lay("failed", f"checkout of branch {branch!r} failed for {slug!r}: {e}")
-    return _lay("checked-out", f"attached {slug!r} to branch {branch!r}")
+    # Attaching without tracking leaves `git pull` with "no tracking information",
+    # which is most of what a developer wanted the branch for.
+    tracked = repo.set_upstream(branch)
+    detail = f" tracking {ORIGIN}/{branch}" if tracked else ""
+    return _lay("checked-out", f"attached {slug!r} to branch {branch!r}{detail}")
 
 
 # --------------------------------------------------------------------------- #
