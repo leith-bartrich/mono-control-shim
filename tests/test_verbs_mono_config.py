@@ -79,7 +79,8 @@ class Registration(unittest.TestCase):
             "place",
             "relocate",
             "retire",
-            "checkout",
+            "checkout",        # pin: hex commit, detaches
+            "checkout_branch",  # follow a declared line: attaches
             "read_layout",
             "write_layout",
             "remote_default_branch",
