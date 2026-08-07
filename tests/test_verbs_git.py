@@ -979,3 +979,78 @@ class ScanReportsAttachment(GitVerbsCase):
         self._acquire_offline("proj")
 
         self.assertIsNone(self._scan()["repos"][0]["branch"])
+
+
+class UpstreamTracking(GitVerbsCase):
+    """#30 stage 3. Attaching without tracking leaves `git pull` saying "no tracking
+    information", which is most of what a developer wanted the branch for."""
+
+    def _def_with_branches(self, slug: str, bare: Path, branches: dict) -> None:
+        (self.config / "repos" / f"{slug}.json").write_text(
+            json.dumps({"slug": slug, "name": slug,
+                        "sources": {"origin": str(bare)}, "branches": branches})
+        )
+
+    def _tracking(self, wt: Path, branch: str = "main") -> tuple:
+        repo = git.GitRepo(wt)
+
+        def cfg(key: str):
+            try:
+                return repo.config_get(key)
+            except git.GitError:
+                return None
+
+        return cfg(f"branch.{branch}.remote"), cfg(f"branch.{branch}.merge")
+
+    def test_attaching_sets_upstream(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._def_with_branches("proj", bare, {"dev": "main"})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        git._place({"slug": "proj", "location": "proj"}, self.ctx)
+
+        out = git._checkout_branch({"slug": "proj", "branch": "dev"}, self.ctx)
+
+        self.assertEqual(out["status"], "checked-out")
+        self.assertIn("tracking origin/main", out["summary"])
+        self.assertEqual(self._tracking(self.work / "proj"), ("origin", "refs/heads/main"))
+
+    def test_a_branch_with_no_counterpart_is_skipped_not_invented(self) -> None:
+        """Inventing an upstream would make `pull` fail later instead of now."""
+        bare, _ = self._make_origin("proj")
+        self._def_with_branches("proj", bare, {"dev": "main"})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        git._place({"slug": "proj", "location": "proj"}, self.ctx)
+        repo = git.GitRepo(self.work / "proj")
+
+        self.assertFalse(repo.set_upstream("local-only"))
+        self.assertEqual(self._tracking(self.work / "proj", "local-only"), (None, None))
+
+    def test_conformance_restores_tracking_a_repoint_wiped(self) -> None:
+        """`git remote remove` -- how conformance repoints -- also wipes
+        `branch.<n>.remote` / `.merge`. Without this, tracking stays silently gone
+        until someone notices `git pull` complaining."""
+        bare, _ = self._make_origin("proj")
+        self._def_with_branches("proj", bare, {"dev": "main"})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        git._place({"slug": "proj", "location": "proj"}, self.ctx)
+        git._checkout_branch({"slug": "proj", "branch": "dev"}, self.ctx)
+        self.assertEqual(self._tracking(self.work / "proj"), ("origin", "refs/heads/main"))
+
+        _git(["remote", "remove", "origin"], self.bare / "proj")
+        self.assertEqual(self._tracking(self.work / "proj"), (None, None))
+
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)  # any operation conforms
+
+        self.assertEqual(self._tracking(self.work / "proj"), ("origin", "refs/heads/main"))
+
+    def test_conform_tracking_is_idempotent(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._def_with_branches("proj", bare, {"dev": "main"})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)
+        repo = git.GitRepo(self.bare / "proj")
+
+        first = git.conform_tracking(repo)
+        second = git.conform_tracking(repo)
+
+        self.assertEqual(first, second)
+        self.assertIn("main", first)
