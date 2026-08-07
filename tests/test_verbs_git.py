@@ -841,3 +841,141 @@ class RemoteConformance(GitVerbsCase):
         self.assertEqual(
             _git(["-C", str(repo_dir), "rev-parse", "refs/heads/main"], repo_dir), captured
         )
+
+
+class CheckoutBranchAttachesADeclaredLine(GitVerbsCase):
+    """``checkout_branch``: the follow-a-line half of the checkout split.
+
+    ``checkout`` takes a hex commit and therefore always detaches, so it
+    structurally could not express "on this branch". The two meanings shared one
+    verb, and the second was lost — leaving no path through the tool to put a
+    materialized worktree on a branch (mono-control#37).
+
+    Safety here is not a ref sanitizer. The branch must be a line the repo
+    *expresses* — declared in its def, or the bare's default HEAD — all read from
+    the host's own disk, exactly as ``_sources`` does for URLs. That makes this
+    verb's reach NARROWER than ``checkout``'s, where any object the container can
+    name is fair game.
+    """
+
+    def _write_def_with_branches(self, slug: str, bare: Path, branches: dict) -> None:
+        (self.config / "repos" / f"{slug}.json").write_text(
+            json.dumps({"slug": slug, "name": slug,
+                        "sources": {"origin": str(bare)}, "branches": branches})
+        )
+
+    def _placed(self, branches: dict | None = None, slug: str = "proj") -> Path:
+        bare, _ = self._make_origin(slug)
+        self._write_def_with_branches(slug, bare, branches or {})
+        git._acquire({"slug": slug, "refs": []}, self.ctx)
+        git._place({"slug": slug, "location": slug}, self.ctx)
+        return self.work / slug
+
+    def _attached(self, wt: Path) -> str | None:
+        return git.GitRepo(wt).attached_branch()
+
+    def test_placement_alone_leaves_head_detached(self) -> None:
+        """The starting condition the reports described."""
+        wt = self._placed()
+        self.assertIsNone(self._attached(wt))
+
+    def test_it_attaches_to_the_declared_line_by_name(self) -> None:
+        wt = self._placed({"dev": "main"})
+
+        out = git._checkout_branch({"slug": "proj", "branch": "dev"}, self.ctx)
+
+        self.assertEqual(out["status"], "checked-out")
+        self.assertEqual(self._attached(wt), "main")
+
+    def test_it_attaches_by_the_concrete_branch_too(self) -> None:
+        wt = self._placed({"dev": "main"})
+
+        out = git._checkout_branch({"slug": "proj", "branch": "main"}, self.ctx)
+
+        self.assertEqual(out["status"], "checked-out")
+        self.assertEqual(self._attached(wt), "main")
+
+    def test_a_repo_declaring_nothing_still_gets_its_default(self) -> None:
+        """Most repos declare no branches; the bare's HEAD is a line all the same."""
+        wt = self._placed({})
+
+        out = git._checkout_branch({"slug": "proj", "branch": "main"}, self.ctx)
+
+        self.assertEqual(out["status"], "checked-out")
+        self.assertEqual(self._attached(wt), "main")
+
+    def test_a_branch_the_repo_does_not_express_is_refused(self) -> None:
+        """Exists locally, expressed nowhere — refused before git is spawned."""
+        wt = self._placed({"dev": "main"})
+        _git(["branch", "sneaky"], wt)
+
+        with self.assertRaises(VerbError) as cm:
+            git._checkout_branch({"slug": "proj", "branch": "sneaky"}, self.ctx)
+
+        self.assertEqual(cm.exception.code, broker.INVALID_PARAMS)
+        self.assertIn("expresses", cm.exception.message)
+        self.assertNotEqual(self._attached(wt), "sneaky")
+
+    def test_a_flag_shaped_value_never_reaches_git(self) -> None:
+        """The hex rule's original worry, closed by membership rather than a regex."""
+        self._placed({"dev": "main"})
+
+        for hostile in ("--upload-pack=touch /tmp/pwned", "-f", "../../etc", "HEAD"):
+            with self.subTest(hostile=hostile):
+                with self.assertRaises(VerbError):
+                    git._checkout_branch({"slug": "proj", "branch": hostile}, self.ctx)
+
+    def test_an_empty_branch_is_rejected(self) -> None:
+        self._placed({"dev": "main"})
+        with self.assertRaises(VerbError):
+            git._checkout_branch({"slug": "proj", "branch": ""}, self.ctx)
+
+    def test_a_declared_line_that_does_not_exist_is_not_created(self) -> None:
+        """mono-control does not create branches; commits do."""
+        wt = self._placed({"future": "not-yet"})
+
+        out = git._checkout_branch({"slug": "proj", "branch": "future"}, self.ctx)
+
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("does not create branches", out["summary"])
+        self.assertIsNone(self._attached(wt))
+
+    def test_a_dirty_worktree_blocks_rather_than_clobbers(self) -> None:
+        wt = self._placed({"dev": "main"})
+        (wt / "a.txt").write_text("dirtied\n")
+
+        out = git._checkout_branch({"slug": "proj", "branch": "dev"}, self.ctx)
+
+        self.assertEqual(out["status"], "blocked")
+
+    def test_an_offline_repo_reports_a_race_not_a_crash(self) -> None:
+        bare, _ = self._make_origin("proj")
+        self._write_def_with_branches("proj", bare, {"dev": "main"})
+        git._acquire({"slug": "proj", "refs": []}, self.ctx)  # no worktree
+
+        out = git._checkout_branch({"slug": "proj", "branch": "dev"}, self.ctx)
+
+        self.assertEqual(out["status"], "race-aborted")
+
+
+class ScanReportsAttachment(GitVerbsCase):
+    """The container cannot reconcile attachment it cannot observe."""
+
+    def test_a_detached_worktree_reports_no_branch(self) -> None:
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "proj"}, self.ctx)
+
+        self.assertIsNone(self._scan()["repos"][0]["branch"])
+
+    def test_an_attached_worktree_reports_its_branch(self) -> None:
+        self._acquire_offline("proj")
+        git._place({"slug": "proj", "location": "proj"}, self.ctx)
+        _git(["checkout", "main", "--"], self.work / "proj")
+
+        self.assertEqual(self._scan()["repos"][0]["branch"], "main")
+
+    def test_an_offline_bare_reports_no_branch(self) -> None:
+        """A bare has no worktree HEAD to speak of."""
+        self._acquire_offline("proj")
+
+        self.assertIsNone(self._scan()["repos"][0]["branch"])

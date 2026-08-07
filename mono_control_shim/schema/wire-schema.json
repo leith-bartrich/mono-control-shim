@@ -70,9 +70,29 @@
     "title": "AcquireResult",
     "type": "object"
   },
+  "CheckoutBranchRequest": {
+    "additionalProperties": false,
+    "description": "Attach ``slug``'s worktree to ``branch`` \u2014 a line the repo *declares*.\n\nThe **follow-a-line** purpose, and a different currency from\n``CheckoutRequest`` on purpose. Checking out a hex commit always detaches, so\nthe pin verb structurally cannot express \"on this branch\"; the two were one\nverb, and the second meaning was lost in translation.\n\n``branch`` is not trusted. Before it reaches git the host resolves it against\nthe lines the repo *expresses* \u2014 those its def declares, plus the bare repo's\nown default ``HEAD`` \u2014 all read host-side, the same rule sources already\nfollow (\"never accepted from the container\"). So the container's reach is not\n\"any ref\" but \"a line this repo expresses\", which is **narrower** than the hex\nform it sits beside: there, any object the container can name is fair game.\n\nThe default counts because ``repo.md`` says the remote's default *is* the line\nunless a def overrides it. Without that, a repo declaring no ``branches`` \u2014\nmost of them \u2014 could never be put on a branch at all.",
+    "properties": {
+      "branch": {
+        "title": "Branch",
+        "type": "string"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug",
+      "branch"
+    ],
+    "title": "CheckoutBranchRequest",
+    "type": "object"
+  },
   "CheckoutRequest": {
     "additionalProperties": false,
-    "description": "Check ``commit`` out at ``slug``'s current location (hex commit only).",
+    "description": "Check ``commit`` out at ``slug``'s current location (hex commit only).\n\nThe **pin** purpose: put this worktree at an exact revision. The revision\ncomes from the ledger (a snapshot, a dep pin), not from a branch, so a hex\ncommit is the right currency and the resulting detached HEAD is correct.",
     "properties": {
       "commit": {
         "title": "Commit",
@@ -297,6 +317,31 @@
     "title": "SaveSystemRequest",
     "type": "object"
   },
+  "SetRemoteRequest": {
+    "additionalProperties": false,
+    "description": "Add or repoint remote ``name`` \u2192 ``url`` on ``slug``'s on-disk checkout.\n\nThe eager fork-remote stamp: :func:`repo_ops.adopt_fork` saves config, then\nasks the broker to conform the named remote into the checkout's\n``.git/config``. Carries a *slug* (the broker resolves its checkout \u2014 the\ncontainer never names host paths) plus the remote ``name`` and its https\n``url``.\n\nSHIM SECURITY (real handler, other repo): all three params are\nattacker-influenced. The broker MUST reject a non-bare slug, a malformed\nremote name, and any non-https / ``transport::``-helper url before running\n``git remote add`` / ``set-url`` \u2014 never interpolating them into a shell.",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string"
+      },
+      "slug": {
+        "title": "Slug",
+        "type": "string"
+      },
+      "url": {
+        "title": "Url",
+        "type": "string"
+      }
+    },
+    "required": [
+      "slug",
+      "name",
+      "url"
+    ],
+    "title": "SetRemoteRequest",
+    "type": "object"
+  },
   "SlugRequest": {
     "additionalProperties": false,
     "description": "A verb keyed only by ``slug`` (e.g. purge a repo definition).",
@@ -337,8 +382,20 @@
     "$defs": {
       "WireRepo": {
         "additionalProperties": false,
-        "description": "One observed checkout in JSON-native form (relative location + state).",
+        "description": "One observed repo in JSON-native form (relative location + state).\n\n``materialized`` -> ``location`` is the worktree path relative to the work\nroot; ``offline`` -> ``location`` is the bare repo's dir (its slug) relative\nto the bare root.",
         "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Branch"
+          },
           "commit": {
             "anyOf": [
               {
@@ -383,7 +440,7 @@
       },
       "WireUnmanaged": {
         "additionalProperties": false,
-        "description": "An unmanaged (unstamped) checkout found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to \u2014 so a foreign tree found under\nthe offline root round-trips back to the offline root, not the workspace one.",
+        "description": "An unmanaged (unstamped) bare repo found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to. An unstamped bare has no worktree\nby definition, so the broker reports it ``offline`` (relative to the bare root).",
         "properties": {
           "location": {
             "title": "Location",
@@ -431,8 +488,20 @@
   },
   "WireRepo": {
     "additionalProperties": false,
-    "description": "One observed checkout in JSON-native form (relative location + state).",
+    "description": "One observed repo in JSON-native form (relative location + state).\n\n``materialized`` -> ``location`` is the worktree path relative to the work\nroot; ``offline`` -> ``location`` is the bare repo's dir (its slug) relative\nto the bare root.",
     "properties": {
+      "branch": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Branch"
+      },
       "commit": {
         "anyOf": [
           {
@@ -477,7 +546,7 @@
   },
   "WireUnmanaged": {
     "additionalProperties": false,
-    "description": "An unmanaged (unstamped) checkout found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to \u2014 so a foreign tree found under\nthe offline root round-trips back to the offline root, not the workspace one.",
+    "description": "An unmanaged (unstamped) bare repo found under one of the roots.\n\nLike ``WireRepo`` it carries a relative ``location`` plus the ``state`` that\nsays which root the location is relative to. An unstamped bare has no worktree\nby definition, so the broker reports it ``offline`` (relative to the bare root).",
     "properties": {
       "location": {
         "title": "Location",

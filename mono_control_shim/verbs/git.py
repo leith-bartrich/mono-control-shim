@@ -26,7 +26,16 @@ so every verb validates at the boundary before it touches disk or spawns git:
 * a layout ``location`` is normalized *inside* the workspace root, and a
   symlinked parent that would redirect the worktree out of it is refused;
 * a ``checkout`` commit must be hex — never a ref or an option — so it cannot
-  smuggle a flag or a branch name into ``git checkout``;
+  smuggle a flag or a branch name into ``git checkout``. Its sibling
+  ``checkout_branch`` takes a branch instead, and is safe by a different route:
+  the value must be a line the repo *expresses* — declared in its def's
+  ``branches`` map, or the bare repo's own default ``HEAD`` — all read host-side,
+  so the container names a line rather than a ref. That is
+  narrower than the hex form, where any object the container can name is fair
+  game — the hex rule was written when the container ran git itself, and it never
+  prevented following a repointed branch anyway (``acquire`` resolves
+  ``refs/heads/<branch>``, so the branch was already followed; detaching only hid
+  it);
 * ``remote_default_branch``'s URL comes from the container (guided-add is still
   *defining* the remote), so its scheme is allow-listed to ``https`` and git is
   run under ``GIT_ALLOW_PROTOCOL=https`` — no ``file://`` / ``ext::`` side
@@ -198,6 +207,20 @@ class GitRepo:
 
     def config_get(self, key: str) -> str:
         return self._git("config", "--get", key)
+
+    def attached_branch(self) -> Optional[str]:
+        """The branch HEAD is attached to, or ``None`` when detached.
+
+        Distinct from ``head_branch``: that one answers "which branch does HEAD
+        name" and is meaningful even while the branch is *unborn*, which is what
+        a fresh bare repo needs. This one answers "is this worktree actually on a
+        branch", where a detached HEAD must read as ``None`` rather than as the
+        branch it happens to sit on.
+        """
+        try:
+            return self._git("symbolic-ref", "--quiet", "--short", "HEAD") or None
+        except GitError:
+            return None  # detached: `symbolic-ref --quiet` exits non-zero
 
     def head_branch(self) -> str:
         """The branch HEAD names — meaningful even while that branch is *unborn*."""
@@ -562,6 +585,11 @@ class _Observed:
     state: str  # "materialized" | "offline"
     commit: Optional[str]
     dirty: bool
+    # The branch the worktree's HEAD is attached to; None when detached, and
+    # always None for an offline bare (no worktree HEAD to speak of). The
+    # container cannot tell "on the branch" from "detached at its tip" without
+    # this, and those are different states it has to reconcile.
+    branch: Optional[str] = None
 
 
 def _observe(ctx: HostContext, bare: Path) -> Optional[_Observed]:
@@ -579,7 +607,10 @@ def _observe(ctx: HostContext, bare: Path) -> Optional[_Observed]:
     wt = repo.worktree_under(ctx.work_root)
     if wt is not None:
         tree = GitRepo(wt)
-        return _Observed(slug, bare, wt, "materialized", tree.current_commit(), tree.is_dirty())
+        return _Observed(
+            slug, bare, wt, "materialized",
+            tree.current_commit(), tree.is_dirty(), tree.attached_branch(),
+        )
     return _Observed(slug, bare, None, "offline", repo.current_commit(), False)
 
 
@@ -636,6 +667,7 @@ def _scan(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
                 "state": obs.state,
                 "commit": obs.commit,
                 "dirty": obs.dirty,
+                "branch": obs.branch,
             }
             for obs in repos.values()
         ],
@@ -678,6 +710,56 @@ def _sources(ctx: HostContext, slug: str) -> dict[str, str]:
     """
     data = json.loads(_repo_def_path(ctx, slug).read_text())
     return dict(data.get("sources") or {})
+
+
+def _branches(ctx: HostContext, slug: str) -> dict[str, str]:
+    """The declared ``line -> branch`` map from the host repo def.
+
+    Read off the host's own disk, never accepted from the container — the same
+    rule ``_sources`` states for URLs. It is what makes ``checkout_branch`` safe
+    without a ref sanitizer: the container names a line, and the host decides what
+    that means.
+    """
+    data = json.loads(_repo_def_path(ctx, slug).read_text())
+    return dict(data.get("branches") or {})
+
+
+def _expressed_line(ctx: HostContext, slug: str, bare: Path, requested: str) -> Optional[str]:
+    """Resolve *requested* to a branch this repo **expresses**, or ``None``.
+
+    A repo expresses a line two ways, and both count:
+
+    * its def **declares** one — ``branches`` maps a purpose to a branch, and
+      either the purpose (``dev``) or the branch (``main``) names it;
+    * git **carries** one — the bare repo's ``HEAD`` is its default branch, set
+      from the remote at clone. ``repo.md`` says the default *is* the line unless
+      a def overrides it, so a repo that declares nothing still expresses this.
+
+    Without the second rule a repo with no ``branches`` map could never be put on
+    a branch at all, which is most repos and would be a worse hole than the one
+    this verb closes.
+    """
+    declared = _branches(ctx, slug)
+    if requested in declared:
+        return declared[requested]
+    if requested in declared.values():
+        return requested
+    try:
+        if requested == GitRepo(bare).head_branch():
+            return requested
+    except GitError:
+        pass
+    return None
+
+
+def _expressed_lines(ctx: HostContext, slug: str, bare: Path) -> str:
+    """Render what a repo expresses, for a refusal message."""
+    parts = [f"{k}={v}" for k, v in sorted(_branches(ctx, slug).items())]
+    try:
+        parts.append(f"default={GitRepo(bare).head_branch()}")
+    except GitError:
+        pass
+    return ", ".join(parts) or "nothing"
 
 
 def _default_source(sources: dict[str, str]) -> Optional[str]:
@@ -963,6 +1045,58 @@ def _checkout(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, A
     except GitError as e:
         return _lay("failed", f"checkout {commit[:12]} failed for {slug!r}: {e}")
     return _lay("checked-out", f"checked out {commit[:12]} for {slug!r}")
+
+
+@verb("checkout_branch")
+def _checkout_branch(params: dict[str, Any], ctx: Optional[HostContext]) -> dict[str, Any]:
+    """Attach ``slug``'s worktree to ``branch`` — a line the repo **declares**.
+
+    Why this exists beside ``checkout`` rather than relaxing it: checking out a
+    hex commit always leaves HEAD detached, so the pin verb structurally cannot
+    express "on this branch". One verb carrying both meanings lost the second.
+
+    Why it is safe without sanitizing a ref: the branch is not taken on trust. It
+    must resolve to a line the repo expresses — see ``_expressed_line`` — all read
+    host-side. A value that does not never reaches git. That makes the container's
+    reach here *narrower* than in ``checkout``, where any object it can name is
+    fair game.
+
+    Deliberately no branch creation: ``repo.md`` is explicit that mono-control
+    does not create branches (commits do). An unborn declared line is reported,
+    not conjured.
+    """
+    ctx = _require_ctx(ctx)
+    slug = _valid_slug(params.get("slug"))
+    requested = params.get("branch")
+    if not isinstance(requested, str) or not requested:
+        raise VerbError(INVALID_PARAMS, f"branch must be a non-empty string: {requested!r}")
+
+    observed = _location_of(ctx, slug)
+    if observed is None or observed.worktree is None:
+        return _race("checkout_branch", slug, "worktree vanished")
+
+    branch = _expressed_line(ctx, slug, observed.bare, requested)
+    if branch is None:
+        raise VerbError(
+            INVALID_PARAMS,
+            f"{requested!r} is not a line {slug!r} expresses "
+            f"(expressed: {_expressed_lines(ctx, slug, observed.bare)})",
+        )
+
+    repo = GitRepo(observed.worktree)
+    if repo.is_dirty():
+        return _lay("blocked", f"{slug!r} became dirty between plan and execute")
+    if repo.resolve_ref(f"refs/heads/{branch}") is None:
+        return _lay(
+            "failed",
+            f"branch {branch!r} does not exist in {slug!r}; mono-control does not "
+            f"create branches",
+        )
+    try:
+        repo.checkout(branch)
+    except GitError as e:
+        return _lay("failed", f"checkout of branch {branch!r} failed for {slug!r}: {e}")
+    return _lay("checked-out", f"attached {slug!r} to branch {branch!r}")
 
 
 # --------------------------------------------------------------------------- #
